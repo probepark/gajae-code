@@ -40,8 +40,19 @@ export interface AdoptStartupMCPDiscoveryOptions {
 /** Cap the logged error so an untrusted/large server response body is never dumped raw. */
 const MAX_REDACTED_ERROR_LENGTH = 500;
 
+/**
+ * Hard cap on the input length BEFORE any regex runs. An MCP server's failure message can carry
+ * the full (remote, untrusted, unbounded) HTTP response body, and a synchronous `String.replace`
+ * over a multi-hundred-KB body is a DoS surface even for linear patterns. Bounding the input here
+ * keeps every regex backstop below super-linear cost regardless of body size.
+ */
+const MAX_REDACTED_INPUT_LENGTH = 4096;
+
 /** Minimum length for a config/env value to be treated as a redactable secret (avoids nuking short non-secret substrings). */
 const MIN_REDACTABLE_SECRET_LENGTH = 4;
+
+/** Minimum length for a stdio argv value to be treated as a likely inline credential (skips short flags/subcommands). */
+const MIN_ARG_SECRET_LENGTH = 12;
 
 /**
  * Defense-in-depth denylist for credential shapes that can appear in a server- or
@@ -50,14 +61,13 @@ const MIN_REDACTABLE_SECRET_LENGTH = 4;
  * backstops forms whose exact value we do not already know.
  */
 const SECRET_VALUE_PATTERN =
-	/(?:authorization[=:]\s*(?:Bearer|Basic)?\s*[^\s,}]+|Bearer\s+\S+|Basic\s+\S+|["']?(?:password|passwd|pwd|client[_-]?secret|access[_-]?key|[a-z0-9_]*secret[a-z0-9_]*|token|api[_-]?key|apikey)["']?\s*[=:]\s*["']?[^"'\s,}]+["']?|--(?:token|api-key|api_key|password|secret|client-secret)[=\s]+\S+|sk-[A-Za-z0-9_-]{8,}|gh[opsur]_[A-Za-z0-9]{20,}|github_pat_[A-Za-z0-9_]{20,}|xox[baprs]-[A-Za-z0-9-]{8,}|AIza[0-9A-Za-z_-]{20,}|eyJ[A-Za-z0-9_-]+\.[A-Za-z0-9_-]+\.[A-Za-z0-9_-]+)/gi;
+	/(?:authorization[=:]\s{0,8}(?:Bearer|Basic)?\s{0,8}[^\s,}]{1,4096}|Bearer\s{1,8}\S{1,4096}|Basic\s{1,8}\S{1,4096}|["']?(?:password|passwd|pwd|client[_-]?secret|access[_-]?key|[a-z0-9_]{0,32}secret[a-z0-9_]{0,32}|token|api[_-]?key|apikey)["']?\s{0,8}[=:]\s{0,8}["']?[^"'\s,}]{1,4096}["']?|--(?:token|api-key|api_key|password|secret|client-secret)[=\s]{1,4}\S{1,4096}|sk-[A-Za-z0-9_-]{8,512}|gh[opsur]_[A-Za-z0-9]{20,512}|github_pat_[A-Za-z0-9_]{20,512}|xox[baprs]-[A-Za-z0-9-]{8,512}|AIza[0-9A-Za-z_-]{20,512}|eyJ[A-Za-z0-9_-]{1,512}\.[A-Za-z0-9_-]{1,512}\.[A-Za-z0-9_-]{1,512})/gi;
 
-/** Strip `user:pass@` userinfo from any URL in the text, unconditionally. */
-const URL_USERINFO_PATTERN = /\/\/[^/\s@]+:[^/\s@]+@/g;
-
-function escapeRegExp(value: string): string {
-	return value.replace(/[.*+?^${}()|[\]\\]/g, "\\$&");
-}
+/**
+ * Strip URL userinfo (`user:pass@` and username-only `token@`) from any URL in the text.
+ * Single bounded character class => strictly linear, no backtracking.
+ */
+const URL_USERINFO_PATTERN = /\/\/[^/\s@]{1,256}@/g;
 
 /**
  * Collect the secret values from a server's own config (the richest, most reliable source):
@@ -71,6 +81,7 @@ export function collectMCPServerSecrets(config: MCPServerConfig | undefined): st
 		env?: Record<string, string>;
 		oauth?: { clientSecret?: string };
 		auth?: { clientSecret?: string };
+		args?: string[];
 	};
 	const values: string[] = [];
 	if (c.url) {
@@ -86,23 +97,38 @@ export function collectMCPServerSecrets(config: MCPServerConfig | undefined): st
 	for (const v of Object.values(c.env ?? {})) if (v) values.push(v);
 	if (c.oauth?.clientSecret) values.push(c.oauth.clientSecret);
 	if (c.auth?.clientSecret) values.push(c.auth.clientSecret);
+	// stdio argv can carry inline credentials (e.g. `--gh-token ghtok_…`); we cannot know which
+	// arg is the secret, so collect the longer values (likely tokens) and let the short flags /
+	// subcommands (`serve`, `--mcp`) fall below the length threshold.
+	for (const a of c.args ?? []) if (a && a.length >= MIN_ARG_SECRET_LENGTH) values.push(a);
 	return [...new Set(values)].filter(v => v.length >= MIN_REDACTABLE_SECRET_LENGTH);
 }
 
 /**
- * Redact a runtime MCP startup failure message before logging. Primary control is structural:
- * exact secret values from the server config + process env (`secrets`) are removed; URL userinfo
- * is always stripped; a denylist backstops common credential shapes; and the output is
- * length-capped so an untrusted response body is never dumped raw.
+ * Redact a runtime MCP startup failure message before logging.
+ *
+ * Order matters for both safety and performance:
+ *  1. Structural, backtracking-free redaction of exact known secret values (config + env) via
+ *     `String.split`/`join` — linear at any length, so it can run on the full body and removes
+ *     secrets regardless of where they appear.
+ *  2. Hard-bound the input length BEFORE any regex. The message can carry an unbounded, untrusted
+ *     remote HTTP response body, and a synchronous regex over it is a DoS surface; bounding here
+ *     keeps every regex backstop below super-linear cost.
+ *  3. Bounded, strictly-linear regex backstops (URL userinfo strip + credential-shape denylist).
+ *  4. Final length cap so a noisy (but now redacted) body is never dumped raw into logs.
  */
 export function redactMCPStartupError(error: string, secrets: readonly string[] = []): string {
-	let out = error.replace(URL_USERINFO_PATTERN, "//[REDACTED]@");
+	let out = error;
 	const ordered = [...new Set(secrets)]
 		.filter(s => s.length >= MIN_REDACTABLE_SECRET_LENGTH)
 		.sort((a, b) => b.length - a.length);
 	for (const secret of ordered) {
-		out = out.replace(new RegExp(escapeRegExp(secret), "g"), "[REDACTED]");
+		out = out.split(secret).join("[REDACTED]");
 	}
+	if (out.length > MAX_REDACTED_INPUT_LENGTH) {
+		out = out.slice(0, MAX_REDACTED_INPUT_LENGTH);
+	}
+	out = out.replace(URL_USERINFO_PATTERN, "//[REDACTED]@");
 	out = out.replace(SECRET_VALUE_PATTERN, "[REDACTED]");
 	if (out.length > MAX_REDACTED_ERROR_LENGTH) {
 		out = `${out.slice(0, MAX_REDACTED_ERROR_LENGTH)}…[truncated]`;

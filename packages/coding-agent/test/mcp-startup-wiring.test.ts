@@ -269,4 +269,35 @@ describe("runtime MCP startup wiring", () => {
 		expect(out.length).toBeLessThanOrEqual(520);
 		expect(out.endsWith("…[truncated]")).toBe(true);
 	});
+
+	it("redacts a large adversarial body well under a DoS budget (no quadratic backtracking)", () => {
+		// Prior denylist had an O(n^2) alternative and capped length *after* the regex, so a
+		// few-hundred-KB `[a-z0-9_]` body (no `secret` literal) blocked the event loop for seconds.
+		// Bounding the input before any regex must keep this trivially fast.
+		const adversarial = `HTTP 400: ${"a".repeat(256 * 1024)}`;
+		const start = performance.now();
+		const out = redactMCPStartupError(adversarial);
+		const elapsed = performance.now() - start;
+		expect(elapsed).toBeLessThan(250);
+		expect(out.length).toBeLessThanOrEqual(520);
+	});
+
+	it("strips username-only URL userinfo (no colon)", () => {
+		const out = redactMCPStartupError("connect https://tokenwithoutcolon123@host/sse failed");
+		expect(out).not.toContain("tokenwithoutcolon123");
+		expect(out).toContain("//[REDACTED]@");
+	});
+
+	it("collects and redacts inline stdio argv credentials", () => {
+		const secrets = collectMCPServerSecrets({
+			type: "stdio",
+			command: "mcp-server",
+			args: ["serve", "--gh-token", "ghtok_inlineArgvSecretValue123"],
+		} as any);
+		expect(secrets).toContain("ghtok_inlineArgvSecretValue123");
+		expect(secrets).not.toContain("serve");
+		expect(redactMCPStartupError("spawn failed: --gh-token ghtok_inlineArgvSecretValue123", secrets)).not.toContain(
+			"ghtok_inlineArgvSecretValue123",
+		);
+	});
 });
