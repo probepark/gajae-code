@@ -10,6 +10,8 @@
 
 - Added opt-in disabled items to `SelectList` (`SelectItem.disabled`): disabled entries render dimmed; arrow navigation wraps while page navigation clamps and both skip disabled targets; filter resets choose the first enabled item; and programmatic selection searches forward from the requested index before falling back backward. Callbacks never receive disabled entries, while enabled-only arrow/page inputs preserve their existing notification behavior. All-disabled lists keep a null selection while an independent viewport remains navigable, with no cursor and a `(-/N)` scroll position.
 
+- Added a `GJC_TUI_SYNC_OUTPUT` env opt-out (default on). GJC wraps render frames in synchronized-output mode 2026 (`\x1b[?2026h`…`\x1b[?2026l`); some SSH terminals (observed on iOS/Android Termius) mishandle synchronized output and/or East-Asian wide cells during partial repaint, which can make already-drawn CJK text flicker between replacement glyphs and the correct syllable. Setting `GJC_TUI_SYNC_OUTPUT=0` emits frames without the mode-2026 wrapper so those terminals apply updates immediately; default output stays byte-identical.
+
 ## [0.10.1] - 2026-07-13
 ### Fixed
 

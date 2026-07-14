@@ -39,6 +39,7 @@ const SEGMENT_RESET = "\x1b[0m";
  */
 const LINE_TERMINATOR = "\x1b[0m\x1b]8;;\x07";
 
+
 type InputListenerResult = { consume?: boolean; data?: string } | undefined;
 type InputListener = (data: string) => InputListenerResult;
 
@@ -624,6 +625,12 @@ export class TUI extends Container {
 	// visible window, bounding per-frame work on huge transcripts. Output stays byte-identical;
 	// set PI_TUI_VIRTUAL_VIEWPORT=0 to restore legacy full-transcript normalization.
 	#virtualViewport = $flag("PI_TUI_VIRTUAL_VIEWPORT", true);
+	// Wrap render frames in synchronized-output mode 2026 (default on). Some SSH
+	// terminals (observed on iOS/Android Termius) mishandle synchronized output
+	// and/or East-Asian wide cells during partial repaint, making already-drawn
+	// CJK text flicker; set GJC_TUI_SYNC_OUTPUT=0 to emit frames without the
+	// mode-2026 wrapper so updates apply immediately.
+	#syncOutput = $flag("GJC_TUI_SYNC_OUTPUT", true);
 	#maxLinesRendered = 0; // Line count from last render, used for viewport calculation
 	#fullRedrawCount = 0;
 	#stopped = false;
@@ -998,7 +1005,13 @@ export class TUI extends Container {
 	}
 
 	#writeTerminal(data: string): boolean {
-		return this.#guardTerminalOperation(() => this.terminal.write(data));
+		// Strip the mode-2026 synchronized-output wrapper at the single write
+		// chokepoint when opted out, so every emit site is covered without
+		// touching the frame content between the markers.
+		const payload = this.#syncOutput
+			? data
+			: data.replaceAll("\x1b[?2026h", "").replaceAll("\x1b[?2026l", "");
+		return this.#guardTerminalOperation(() => this.terminal.write(payload));
 	}
 
 	#hideCursor(): boolean {
