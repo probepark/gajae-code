@@ -1,0 +1,71 @@
+{
+  "schema_version": 1,
+  "kind": "api-package-test-report",
+  "suite": "coordinator-codex-bridge-redteam",
+  "cases": [
+    {
+      "id": "endpoint-bypass",
+      "scenario": "Rejected TCP spelling variants, relative and empty Unix paths, and a directly tampered persisted non-loopback handoff.",
+      "expected": "Only absolute Unix paths and exact loopback endpoints are accepted; persisted handoffs are revalidated.",
+      "verdict": "passed"
+    },
+    {
+      "id": "wake-idempotency-and-key-abuse",
+      "scenario": "Concurrent recordCodexWakeEvent calls and malformed/path-like wake acknowledgement keys. Re-run after per-event withFileLock fix: exactly one created:true, ack idempotent, malformed keys rejected.",
+      "expected": "At most one concurrent caller reports created:true; acknowledgement is idempotent; malformed keys are rejected.",
+      "verdict": "passed"
+    },
+    {
+      "id": "token-hygiene",
+      "scenario": "Token-file publication, state-root secret scan, unreadable token error, and raw token MCP registration argument.",
+      "expected": "Only token-file references persist; the token is absent from state and errors; raw token input is rejected.",
+      "verdict": "passed"
+    },
+    {
+      "id": "prompt-injection-and-final-response-leak",
+      "scenario": "Control-character and 100KB summary injection plus a turn record containing a final_response sentinel.",
+      "expected": "Wake prompt is whitespace-normalized and bounded, and never contains final_response text.",
+      "verdict": "passed"
+    },
+    {
+      "id": "wake-gating-and-failure-recording",
+      "scenario": "Non-exact idle status response shapes and a throwing thread/resume transport.",
+      "expected": "turn/start occurs only after {status:'idle'}; publish errors create failed wake state with snake_case error code.",
+      "verdict": "passed"
+    },
+    {
+      "id": "delegate-flow-hook-spoofing",
+      "scenario": "Suffix, prefix, extended-token, Unicode-homoglyph, and 1MB prompt variants; canonical skill set assertion. Re-run after symmetric ASCII boundary fix; ultragoal keyword adjacency recorded as waived pre-existing behavior (W3).",
+      "expected": "Only the exact delegate-flow token persists host context and no spoofed token activates a workflow; workflow set remains four canonical skills.",
+      "verdict": "passed"
+    },
+    {
+      "id": "external-surface-and-worktree-boundary",
+      "scenario": "Read-only /Users/probe/.codex mtime check and git status allowlist after the suite.",
+      "expected": "Tests do not modify /Users/probe/.codex and introduce no changes outside the known bridge change set plus permitted QA artifacts.",
+      "verdict": "passed"
+    }
+  ],
+  "findings": [
+    {
+      "id": "FINDING-CB-001",
+      "severity": "high",
+      "title": "Concurrent wake recording is not atomic",
+      "status": "fixed",
+      "evidence": "Fixed by wrapping record/update/ack in withFileLock per event file with terminal acked state; redteam suite now asserts exactly one created:true under Promise.all x5 and passes."
+    },
+    {
+      "id": "FINDING-CB-002",
+      "severity": "medium",
+      "title": "Delegate-flow suffix spoof persists context and activates ultragoal",
+      "status": "fixed-partial-waived",
+      "evidence": "Boundary regex now uses symmetric [^A-Za-z0-9_-]; uppercase/digit adjacency no longer matches. '$gjc-mcp-delegate-flow$ultragoal' activating ultragoal via the 'ultragoal' keyword is pre-existing keyword behavior, recorded as waiver W3 in the ultragoal ledger."
+    }
+  ],
+  "command": "cd packages/coding-agent && bun test test/coordinator-codex-bridge-redteam.test.ts",
+  "totals": {
+    "pass": 7,
+    "fail": 0
+  },
+  "rerun": "cd packages/coding-agent && bun test test/coordinator-codex-bridge-redteam.test.ts \u2014 7 pass, 0 fail after fixes"
+}

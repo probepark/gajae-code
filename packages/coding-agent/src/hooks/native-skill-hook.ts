@@ -5,6 +5,7 @@ import { YAML } from "bun";
 import type { SkillDiscoverySettings } from "../config/skill-settings-defaults";
 import { DEFAULT_DISABLED_EXTENSIONS, DEFAULT_SKILL_DISCOVERY_SETTINGS } from "../config/skill-settings-defaults";
 import { sessionLogsDir } from "../gjc-runtime/session-layout";
+import { persistMcpDelegateHostContext } from "./mcp-delegate-host-context";
 import {
 	buildActiveUltragoalPromptContext,
 	buildSkillActivationAdditionalContext,
@@ -286,6 +287,19 @@ export async function dispatchGjcNativeSkillHook(
 		});
 		const recoveryContext = buildStateRecoveryDiagnosticsContext(recoveryDiagnostics);
 		const prompt = readPromptText(payload);
+		let mcpDelegateHostContextPath: string | null = null;
+		try {
+			const persistedHostContext = await persistMcpDelegateHostContext({
+				cwd,
+				sessionId: readSessionId(payload),
+				threadId: readThreadId(payload),
+				turnId: readTurnId(payload),
+				prompt,
+			});
+			mcpDelegateHostContextPath = persistedHostContext?.path ?? null;
+		} catch (error) {
+			await logHookError(cwd, "mcp_delegate_host_context_persist_error", error);
+		}
 		const skillState = prompt
 			? await recordSkillActivation({
 					cwd,
@@ -330,6 +344,9 @@ export async function dispatchGjcNativeSkillHook(
 			skillState ? buildSkillActivationAdditionalContext(skillState, effectiveSkillConfig) : activeUltragoalContext,
 			recoveryContext,
 			classifyQuestionOnlyPrompt(prompt),
+			mcpDelegateHostContextPath
+				? `GJC MCP delegate-flow host context persisted at ${mcpDelegateHostContextPath}.`
+				: null,
 		]
 			.filter((value): value is string => Boolean(value))
 			.join(" ");
