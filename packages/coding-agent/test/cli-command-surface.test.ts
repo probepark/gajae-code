@@ -3,6 +3,7 @@ import * as fs from "node:fs/promises";
 import * as os from "node:os";
 import * as path from "node:path";
 import packageJson from "../package.json";
+import { routeRootArgv } from "../src/cli";
 import { parseArgs } from "../src/cli/args";
 
 const repoRoot = path.resolve(import.meta.dir, "..", "..", "..");
@@ -15,6 +16,23 @@ function extractRegisteredCommands(source: string): string[] {
 }
 
 describe("GJC public CLI command surface", () => {
+	it("routes legacy coordinator MCP and team launch invocations to native commands", () => {
+		expect(routeRootArgv(["coordinator-mcp"])).toEqual(["mcp-serve", "coordinator"]);
+		expect(routeRootArgv(["--team", "--team-size", "2", "team smoke"])).toEqual(["team", "2", "team smoke"]);
+		expect(routeRootArgv(["--team", "--team-size=2", "team smoke"])).toEqual(["team", "2", "team smoke"]);
+		expect(routeRootArgv(["team discussion", "--team"])).toEqual(["launch", "team discussion", "--team"]);
+		expect(routeRootArgv(["--team", "--team-size", "shutdown", "victim"])).toEqual([
+			"team",
+			"0",
+			"invalid legacy --team-size",
+		]);
+		expect(routeRootArgv(["--team", "--team-size", "2", "--team-size=3", "team smoke"])).toEqual([
+			"team",
+			"0",
+			"invalid legacy --team-size",
+		]);
+	});
+
 	it("registers launch plus retained workflow/runtime utility endpoints", async () => {
 		const source = await Bun.file(cliEntry).text();
 		expect(extractRegisteredCommands(source)).toEqual([
@@ -158,6 +176,19 @@ describe("GJC public CLI command surface", () => {
 		expect(output).toContain("do not commit");
 		expect(output).toContain("existing tmux/GJC --tmux session");
 		expect(output).toContain("gjc --tmux");
+	}, 30_000);
+
+	it("routes legacy team help before root help fast paths", () => {
+		const result = Bun.spawnSync(["bun", cliEntry, "--team", "--team-size", "2", "--help"], {
+			cwd: repoRoot,
+			stderr: "pipe",
+			stdout: "pipe",
+		});
+		const output = `${result.stdout.toString()}\n${result.stderr.toString()}`;
+
+		expect(result.exitCode, output).toBe(0);
+		expect(output).toContain("--dry-run");
+		expect(output).toContain(".gjc/_session-{sessionid}/state/team");
 	}, 30_000);
 
 	it("does not capture absolute-path prompts as startup slash commands", () => {
