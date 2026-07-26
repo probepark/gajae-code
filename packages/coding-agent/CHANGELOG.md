@@ -6,6 +6,7 @@
 
 - Aligned the startup GJC Forge splash border with the composer trailing gutter, including the one-row constrained fallback.
 - `gjc resume` and delete no longer pay a durable (fsync-backed) lock acquisition for managed session tombstones that have nothing left to reconcile; a scope with many accumulated already-completed tombstones opens noticeably faster (#3067).
+- MCP servers configured with a large `timeout` no longer widen the startup hang window for every consumer. The long startup ceiling now applies only to ACP lifecycle launches that supply their own MCP servers, derived from the session readiness deadline with reserved headroom; ordinary CLI/SDK `mcpConfigPath`, project, user, and plugin-bundle consumers keep the short default. An ACP launch that reaches the readiness cutoff before MCP startup now fails fast as a pending startup instead of silently falling back to the ordinary ceiling.
 
 ### Added
 

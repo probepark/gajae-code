@@ -7,7 +7,7 @@ import type { Args as ParsedArgs } from "../cli/args";
 import { Settings } from "../config/settings";
 import { applyStartupModelProfiles, createSessionManager } from "../main";
 import { initializeExtensions } from "../modes/runtime-init";
-import { ACP_MCP_REQUEST_TIMEOUT_MS } from "../sdk/acp/mcp";
+import { ACP_MCP_REQUEST_TIMEOUT_MS, ACP_MCP_STARTUP_HEADROOM_MS } from "../sdk/acp/mcp";
 import { Broker } from "../sdk/broker/broker";
 import { completeBrokerProcess } from "../sdk/broker/internal";
 import {
@@ -287,53 +287,97 @@ export async function runSessionHost(
 		throw new Error("SDK startup did not complete before readiness cutoff.");
 	}
 
-	let opened: { parsed: ParsedArgs; sessionManager: SessionManager | undefined };
-	let created: CreateLifecycleAgentSessionResult;
-	let mcpConfigDirectory: string | undefined;
-	try {
-		opened = await openLifecycleSessionManager(request, cwd, agentDir);
-		let mcpConfigPath: string | undefined;
-		if (request.mcpServers && request.mcpServers.length > 0) {
-			mcpConfigDirectory = await fs.realpath(await fs.mkdtemp(path.join(os.tmpdir(), "gjc-acp-mcp-")));
-			mcpConfigPath = path.join(mcpConfigDirectory, "mcp.json");
-			await Bun.write(
-				mcpConfigPath,
-				JSON.stringify({
-					mcpServers: Object.fromEntries(
-						request.mcpServers.map(server => [
-							server.name,
-							"url" in server
-								? {
-										type: server.type,
-										url: server.url,
-										...(server.headers ? { headers: server.headers } : {}),
-										timeout: ACP_MCP_REQUEST_TIMEOUT_MS,
-									}
-								: {
-										type: "stdio",
-										command: server.command,
-										args: server.args,
-										...(server.env ? { env: server.env } : {}),
-										noInheritEnv: true,
-										timeout: ACP_MCP_REQUEST_TIMEOUT_MS,
-									},
-						]),
-					),
-				}),
-			);
-		}
-		created = await createLifecycleAgentSession({
-			cwd,
-			agentDir,
-			sessionManager: opened.sessionManager,
-			...(mcpConfigPath ? { mcpConfigPath } : {}),
-		});
-	} catch (error) {
+	// Inlined rather than extracted to a helper: TypeScript's definite-assignment
+	// analysis does not see a `Promise<never>` helper as terminating, so hoisting
+	// this would make `opened`/`created` "used before assigned" below.
+	const registrationFailure = async (error: unknown): Promise<SdkStartupFailure> => {
 		const rollback = new SdkStartupRollbackTracker();
 		rollback.recordAbsent();
 		const failure = normalizeSdkStartupFailure("registration", "failed", error);
 		await writeFailure(failure, rollback.result);
-		throw failure;
+		return failure;
+	};
+
+	let opened: { parsed: ParsedArgs; sessionManager: SessionManager | undefined };
+	let created: CreateLifecycleAgentSessionResult;
+	let mcpConfigDirectory: string | undefined;
+	try {
+		let mcpConfigPath: string | undefined;
+		try {
+			opened = await openLifecycleSessionManager(request, cwd, agentDir);
+			if (request.mcpServers && request.mcpServers.length > 0) {
+				mcpConfigDirectory = await fs.realpath(await fs.mkdtemp(path.join(os.tmpdir(), "gjc-acp-mcp-")));
+				mcpConfigPath = path.join(mcpConfigDirectory, "mcp.json");
+				await Bun.write(
+					mcpConfigPath,
+					JSON.stringify({
+						mcpServers: Object.fromEntries(
+							request.mcpServers.map(server => [
+								server.name,
+								"url" in server
+									? {
+											type: server.type,
+											url: server.url,
+											...(server.headers ? { headers: server.headers } : {}),
+											timeout: ACP_MCP_REQUEST_TIMEOUT_MS,
+										}
+									: {
+											type: "stdio",
+											command: server.command,
+											args: server.args,
+											...(server.env ? { env: server.env } : {}),
+											noInheritEnv: true,
+											timeout: ACP_MCP_REQUEST_TIMEOUT_MS,
+										},
+							]),
+						),
+					}),
+				);
+			}
+		} catch (error) {
+			throw await registrationFailure(error);
+		}
+
+		// The longer MCP startup ceiling is scoped to ACP lifecycle launches only:
+		// it applies when this request actually carried `mcpServers`. Ordinary
+		// CLI/SDK `mcpConfigPath` consumers keep the manager's short default.
+		//
+		// This recheck deliberately sits OUTSIDE the registration catch above.
+		// Inside it, the throw would be caught, reclassified as
+		// `registration`/`failed`, and written a second time, losing the
+		// `startup`/`pending` outcome the readiness cutoff is supposed to report.
+		// Session-manager open and MCP config write already consumed part of the
+		// budget, so re-read the clock here rather than reusing the earlier check.
+		let mcpStartupTimeoutMs: number | undefined;
+		if (mcpConfigPath !== undefined) {
+			const remaining = request.semanticReadyDeadlineAt - now() - ACP_MCP_STARTUP_HEADROOM_MS;
+			if (remaining <= 0) {
+				const absent = new SdkStartupRollbackTracker();
+				absent.recordAbsent();
+				await writeFailure(
+					{
+						phase: "startup",
+						reason: "pending",
+						message: "SDK startup did not complete before readiness cutoff.",
+					},
+					absent.result,
+				);
+				throw new Error("SDK startup did not complete before readiness cutoff.");
+			}
+			mcpStartupTimeoutMs = remaining;
+		}
+
+		try {
+			created = await createLifecycleAgentSession({
+				cwd,
+				agentDir,
+				sessionManager: opened.sessionManager,
+				...(mcpConfigPath ? { mcpConfigPath } : {}),
+				...(mcpStartupTimeoutMs !== undefined ? { mcpStartupTimeoutMs } : {}),
+			});
+		} catch (error) {
+			throw await registrationFailure(error);
+		}
 	} finally {
 		if (mcpConfigDirectory) await fs.rm(mcpConfigDirectory, { recursive: true, force: true });
 	}

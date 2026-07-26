@@ -168,6 +168,7 @@ import { buildNamedToolChoice, buildNamedToolChoiceResult } from "../utils/tool-
 import { buildWorkspaceTree, type WorkspaceTree } from "../workspace-tree";
 import {
 	attachLifecycleStartupCapability,
+	lifecycleMcpStartupTimeoutOption,
 	lifecycleStartupCapabilityOption,
 	type SdkStartupCapability,
 } from "./startup-capability";
@@ -1028,6 +1029,11 @@ export async function createAgentSession(options: CreateAgentSessionOptions = {}
 	const lifecycleStartupCapability = (
 		options as CreateAgentSessionOptions & { [lifecycleStartupCapabilityOption]?: SdkStartupCapability }
 	)[lifecycleStartupCapabilityOption];
+	// ACP lifecycle launches carry their own MCP startup budget; every other
+	// consumer keeps the manager's short default ceiling.
+	const lifecycleMcpStartupTimeoutMs = (
+		options as CreateAgentSessionOptions & { [lifecycleMcpStartupTimeoutOption]?: number }
+	)[lifecycleMcpStartupTimeoutOption];
 	const isCanonicalSubSession =
 		(options.taskDepth ?? 0) > 0 || Boolean(options.parentTaskPrefix) || Boolean(options.currentAgentType);
 	if (isCanonicalSubSession && options.mcpConfigPath !== undefined) {
@@ -1720,7 +1726,12 @@ export async function createAgentSession(options: CreateAgentSessionOptions = {}
 
 		const preExactCustomToolNames = customTools.map(tool => tool.name);
 		if (explicitMcpConfigPath !== undefined) {
-			const owned = new MCPManager(cwd, null, { toolsOnly: true });
+			const owned = new MCPManager(cwd, null, {
+				toolsOnly: true,
+				...(lifecycleMcpStartupTimeoutMs !== undefined
+					? { maxStartupTimeoutMs: lifecycleMcpStartupTimeoutMs }
+					: {}),
+			});
 			owned.setAuthStorage(authStorage);
 			mcpManager = owned;
 			ownsMcpManager = true;

@@ -92,8 +92,12 @@ describe("MCP manager lifecycle cleanup", () => {
 		expect(manager.getConnectedServers()).toEqual([]);
 		await expect(manager.waitForConnection("bad")).rejects.toThrow("MCP server not connected: bad");
 	});
-	test("honors a configured startup timeout for a slow stdio gateway", async () => {
-		const manager = new MCPManager(process.cwd());
+	// The long startup ceiling is ACP-scoped (PR #3164 Option B): a slow gateway
+	// gets its configured window only when the caller supplies an explicit
+	// budget, as ACP lifecycle launches do. Without one, the short default
+	// applies so an ordinary consumer cannot be hung by a large `timeout`.
+	test("honors a configured startup timeout for a slow stdio gateway on an ACP-scoped budget", async () => {
+		const manager = new MCPManager(process.cwd(), null, { maxStartupTimeoutMs: 30_500 });
 		const delayedServer = `
 const readline = require('node:readline');
 const rl = readline.createInterface({ input: process.stdin });
@@ -124,6 +128,50 @@ setInterval(() => {}, 1000);
 
 			expect(result.errors).toEqual(new Map());
 			expect(result.connectedServers).toEqual(["slow-gateway"]);
+		} finally {
+			await manager.disconnectAll();
+		}
+	});
+
+	// The same slow gateway must NOT be able to hang an ordinary consumer for
+	// ~30s: without an ACP budget the short default ceiling applies and startup
+	// gives up quickly instead of waiting out the configured `timeout`.
+	test("does not grant the long startup window to a non-ACP consumer", async () => {
+		const manager = new MCPManager(process.cwd());
+		const delayedServer = `
+const readline = require('node:readline');
+const rl = readline.createInterface({ input: process.stdin });
+rl.on('line', line => {
+  const msg = JSON.parse(line);
+  if (msg.method === 'initialize') {
+    setTimeout(() => {
+      process.stdout.write(JSON.stringify({ jsonrpc: '2.0', id: msg.id, result: { protocolVersion: '2025-03-26', capabilities: { tools: {} }, serverInfo: { name: 'slow-gateway', version: '1' } } }) + '\\n');
+    }, 2200);
+  } else if (msg.method === 'tools/list') {
+    process.stdout.write(JSON.stringify({ jsonrpc: '2.0', id: msg.id, result: { tools: [] } }) + '\\n');
+  }
+});
+setInterval(() => {}, 1000);
+`;
+
+		const startedAt = Date.now();
+		try {
+			const result = await manager.connectServers(
+				{
+					"slow-gateway": {
+						command: process.execPath,
+						args: ["-e", delayedServer],
+						timeout: 5_000,
+					},
+				},
+				{},
+			);
+
+			// Startup gave up at the short default ceiling rather than waiting for
+			// the 2.2s handshake behind a 5s configured timeout.
+			expect(result.connectedServers).toEqual([]);
+			expect(result.errors.get("slow-gateway")).toContain("timed out");
+			expect(Date.now() - startedAt).toBeLessThan(2_200);
 		} finally {
 			await manager.disconnectAll();
 		}

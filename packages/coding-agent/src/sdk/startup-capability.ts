@@ -22,6 +22,12 @@ const MAX_MESSAGE_BYTES = 512;
 
 /** Internal symbols for lifecycle-only SDK startup construction and bus wiring. */
 export const lifecycleStartupCapabilityOption: unique symbol = Symbol("lifecycleStartupCapability");
+/**
+ * Internal option carrying the startup budget for ACP lifecycle MCP launches.
+ * Only set when the lifecycle request actually supplies `mcpServers`, so the
+ * longer ceiling never leaks to ordinary CLI/SDK `mcpConfigPath` consumers.
+ */
+export const lifecycleMcpStartupTimeoutOption: unique symbol = Symbol("lifecycleMcpStartupTimeout");
 const lifecycleStartupCapabilityOnApi: unique symbol = Symbol("lifecycleStartupCapabilityOnApi");
 
 export function attachLifecycleStartupCapability(api: object, capability: SdkStartupCapability): void {
