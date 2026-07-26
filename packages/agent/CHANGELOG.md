@@ -4,7 +4,7 @@
 
 ### Fixed
 
-- Repeated malformed tool calls now get one tool-free recovery response, preventing argument-validation loops from ending without an answer while leaving ordinary execution-error retries unchanged.
+- Repeated malformed tool calls now get one tool-free recovery response, preventing argument-validation loops from ending without an answer while leaving ordinary execution-error retries unchanged. The recovery turn commits its assistant to the durable context, forces `toolChoice: "none"` alongside an empty tool list without consuming a queued tool choice, and never executes a tool call it did not advertise. Its recovery prompt is request-only, so append-only tool prefixes stay stable and the durable message log is unchanged.
 
 ## [0.11.10] - 2026-07-25
 

@@ -16,6 +16,7 @@ import {
 	type ToolResultMessage,
 	type TSchema,
 	transportFailureFacts,
+	type UserMessage,
 	validateToolArguments,
 	zodToWireSchema,
 } from "@gajae-code/ai";
@@ -1249,7 +1250,11 @@ async function runLoopBody(
 	// `invalid_prompt` circuit breaker below.
 	let invalidPromptRepairAttempted = false;
 	let previousMalformedToolSignatures = new Set<string>();
-	let recoverWithoutTools = false;
+	const recoveryState: {
+		pending: boolean;
+		inserted: boolean;
+		syntheticMessage?: UserMessage;
+	} = { pending: false, inserted: false };
 	let malformedToolRecoveryAttempted = false;
 
 	// Outer loop: continues when queued follow-up messages arrive after agent would stop
@@ -1335,24 +1340,17 @@ async function runLoopBody(
 								attemptTransaction.stageAssistantMessageEvent(partial, event),
 						}
 					: config;
-				const responseContext = recoverWithoutTools
-					? {
-							...currentContext,
-							messages: [
-								...currentContext.messages,
-								{
-									role: "user" as const,
-									content: repeatedToolFailureRecoveryPrompt,
-									synthetic: true,
-									timestamp: Date.now(),
-								},
-							],
-							tools: [],
-						}
-					: currentContext;
-				recoverWithoutTools = false;
+				if (recoveryState.pending && !recoveryState.inserted) {
+					recoveryState.syntheticMessage = {
+						role: "user",
+						content: repeatedToolFailureRecoveryPrompt,
+						synthetic: true,
+						timestamp: Date.now(),
+					};
+					recoveryState.inserted = true;
+				}
 				message = await streamAssistantResponse(
-					responseContext,
+					currentContext,
 					attemptConfig,
 					loopSignal,
 					attemptTransaction ? (attemptTransaction as unknown as EventStream<AgentEvent, AgentMessage[]>) : stream,
@@ -1361,6 +1359,9 @@ async function runLoopBody(
 					stepCounter,
 					streamFn,
 					harmonyRetryAttempt,
+					recoveryState.pending && recoveryState.syntheticMessage
+						? { syntheticMessage: recoveryState.syntheticMessage }
+						: undefined,
 				);
 				const detection = detectHarmonyLeakInAssistantMessage(message);
 				if (detection && shouldMitigateHarmonyLeak(config.model, detection)) {
@@ -1513,6 +1514,7 @@ async function runLoopBody(
 			if (config.fallbackManaged && message.stopReason !== "error" && message.stopReason !== "aborted") {
 				await config.onManagedAttemptAccepted?.();
 			}
+			const wasRecoveryAttempt = recoveryState.pending;
 
 			if (message.stopReason === "error" || message.stopReason === "aborted") {
 				// Create placeholder tool results for any tool calls in the aborted message
@@ -1549,35 +1551,61 @@ async function runLoopBody(
 			const toolResults: ToolResultMessage[] = [];
 			let repeatedMalformedToolCall = false;
 			if (hasMoreToolCalls) {
-				const executionResult = await executeToolCalls(
-					currentContext,
-					message,
-					loopSignal,
-					stream,
-					config,
-					telemetry,
-					invokeAgentSpan,
-				);
-
-				toolResults.push(...executionResult.toolResults);
-				steeringMessagesFromExecution = executionResult.steeringMessages;
-
-				const malformedSignatures = executionResult.malformedToolCallSignatures;
-				const allToolCallsMalformed = toolResults.length > 0 && malformedSignatures.length === toolResults.length;
-				if (allToolCallsMalformed) {
-					const uniqueMalformedSignatures = new Set(malformedSignatures);
-					repeatedMalformedToolCall =
-						uniqueMalformedSignatures.size < malformedSignatures.length ||
-						[...uniqueMalformedSignatures].some(signature => previousMalformedToolSignatures.has(signature));
-					previousMalformedToolSignatures = uniqueMalformedSignatures;
+				if (wasRecoveryAttempt) {
+					for (const toolCall of toolCalls) {
+						const result = createAbortedToolResult(
+							toolCall,
+							stream,
+							"error",
+							"Tool calls are disabled during repeated malformed tool-call recovery.",
+						);
+						currentContext.messages.push(result);
+						newMessages.push(result);
+						toolResults.push(result);
+						recordSkippedTool(telemetry, {
+							toolCallId: toolCall.id,
+							toolName: toolCall.name,
+							status: "skipped",
+						});
+					}
 				} else {
-					previousMalformedToolSignatures = new Set();
-				}
+					const executionResult = await executeToolCalls(
+						currentContext,
+						message,
+						loopSignal,
+						stream,
+						config,
+						telemetry,
+						invokeAgentSpan,
+					);
 
-				for (const result of toolResults) {
-					currentContext.messages.push(result);
-					newMessages.push(result);
+					toolResults.push(...executionResult.toolResults);
+					steeringMessagesFromExecution = executionResult.steeringMessages;
+
+					const malformedSignatures = executionResult.malformedToolCallSignatures;
+					const allToolCallsMalformed =
+						toolResults.length > 0 && malformedSignatures.length === toolResults.length;
+					if (allToolCallsMalformed) {
+						const uniqueMalformedSignatures = new Set(malformedSignatures);
+						repeatedMalformedToolCall =
+							uniqueMalformedSignatures.size < malformedSignatures.length ||
+							[...uniqueMalformedSignatures].some(signature => previousMalformedToolSignatures.has(signature));
+						previousMalformedToolSignatures = uniqueMalformedSignatures;
+					} else {
+						previousMalformedToolSignatures = new Set();
+					}
+
+					for (const result of toolResults) {
+						currentContext.messages.push(result);
+						newMessages.push(result);
+					}
 				}
+			}
+
+			if (wasRecoveryAttempt) {
+				recoveryState.pending = false;
+				recoveryState.inserted = false;
+				recoveryState.syntheticMessage = undefined;
 			}
 
 			stream.push({ type: "turn_end", message, toolResults });
@@ -1594,7 +1622,9 @@ async function runLoopBody(
 				return;
 			}
 			if (repeatedMalformedToolCall && !malformedToolRecoveryAttempted) {
-				recoverWithoutTools = true;
+				recoveryState.pending = true;
+				recoveryState.inserted = false;
+				recoveryState.syntheticMessage = undefined;
 				malformedToolRecoveryAttempted = true;
 			}
 		}
@@ -1652,6 +1682,7 @@ async function streamAssistantResponse(
 	stepCounter: StepCounter,
 	streamFn?: StreamFn,
 	harmonyRetryAttempt = 0,
+	recoveryMode?: { syntheticMessage: UserMessage },
 ): Promise<AssistantMessage> {
 	// Apply context transform if configured (AgentMessage[] → AgentMessage[])
 	let messages = context.messages;
@@ -1676,7 +1707,24 @@ async function streamAssistantResponse(
 			tools: normalizeTools(context.tools, !!config.intentTracing),
 		};
 	}
-
+	if (recoveryMode) {
+		if (config.appendOnlyContext) {
+			const syntheticMessages = normalizeMessagesForProvider(
+				await config.convertToLlm([recoveryMode.syntheticMessage]),
+				config.model,
+			);
+			llmContext = { ...llmContext, messages: [...llmContext.messages, ...syntheticMessages], tools: [] };
+		} else {
+			llmContext = {
+				...llmContext,
+				messages: normalizeMessagesForProvider(
+					await config.convertToLlm([...messages, recoveryMode.syntheticMessage]),
+					config.model,
+				),
+				tools: [],
+			};
+		}
+	}
 	const streamFunction = streamFn || streamSimple;
 
 	// Resolve API key (important for expiring tokens) — do this before resolving
@@ -1691,7 +1739,7 @@ async function streamAssistantResponse(
 
 	const resolvedMetadata = config.metadataResolver ? config.metadataResolver(config.model.provider) : config.metadata;
 
-	const dynamicToolChoice = config.getToolChoice?.();
+	const dynamicToolChoice = recoveryMode ? undefined : config.getToolChoice?.();
 	const dynamicReasoning = config.getReasoning?.();
 	const harmonyMitigationEnabled = isHarmonyLeakMitigationTarget(config.model);
 	const harmonyAbortController = harmonyMitigationEnabled ? new AbortController() : undefined;
@@ -1702,7 +1750,7 @@ async function streamAssistantResponse(
 		: signal;
 	const effectiveTemperature =
 		harmonyRetryAttempt > 0 && config.temperature !== undefined ? config.temperature + 0.05 : config.temperature;
-	const effectiveToolChoice = dynamicToolChoice ?? config.toolChoice;
+	const effectiveToolChoice = recoveryMode ? "none" : (dynamicToolChoice ?? config.toolChoice);
 	const effectiveReasoning = dynamicReasoning ?? config.reasoning;
 
 	const chatStepNumber = stepCounter.count;
