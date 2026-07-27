@@ -264,6 +264,55 @@ describe("ACP request failure codes", () => {
 		expect(error).toBeInstanceOf(RequestError);
 		expect((error as RequestError).code).toBe(-32601);
 	});
+
+	// A bare `Error` carries no internal code, so `acpRequestFailure` returns it
+	// unmapped and the SDK collapses it to `-32603 Internal error`. These three are
+	// client input mistakes: reporting them as agent faults tells the client to retry
+	// something that can never succeed.
+	it("reports an unsupported session mode as invalid params", async () => {
+		const error = await agent()
+			.setSessionMode({ sessionId: "any", modeId: "no-such-mode" } as never)
+			.catch((e: unknown) => e);
+
+		expect(acpRequestFailure(error)).toBeInstanceOf(RequestError);
+		expect((acpRequestFailure(error) as RequestError).code).toBe(-32602);
+	});
+
+	it("reports a relative session cwd as invalid params", async () => {
+		const error = await agent()
+			.newSession({ cwd: "relative/path", mcpServers: [] } as never)
+			.catch((e: unknown) => e);
+
+		expect(acpRequestFailure(error)).toBeInstanceOf(RequestError);
+		expect((acpRequestFailure(error) as RequestError).code).toBe(-32602);
+	});
+
+	it("reports a malformed session cursor as invalid params", async () => {
+		const error = await agent()
+			.listSessions({ cursor: "not-a-number" } as never)
+			.catch((e: unknown) => e);
+
+		expect(acpRequestFailure(error)).toBeInstanceOf(RequestError);
+		expect((acpRequestFailure(error) as RequestError).code).toBe(-32602);
+	});
+
+	it("reports an unknown auth method as invalid params", async () => {
+		const error = await agent()
+			.authenticate({ methodId: "no-such-method" } as never)
+			.catch((e: unknown) => e);
+
+		expect(acpRequestFailure(error)).toBeInstanceOf(RequestError);
+		expect((acpRequestFailure(error) as RequestError).code).toBe(-32602);
+	});
+
+	it("reports an unknown session config option as invalid params", async () => {
+		const error = await agent()
+			.setSessionConfigOption({ sessionId: "any", configId: "no-such-option", value: "x" } as never)
+			.catch((e: unknown) => e);
+
+		expect(acpRequestFailure(error)).toBeInstanceOf(RequestError);
+		expect((acpRequestFailure(error) as RequestError).code).toBe(-32602);
+	});
 	it("maps adapter error codes and preserves their discriminators", () => {
 		const cases = [
 			{ code: "authentication_failed", expectedCode: -32000 },

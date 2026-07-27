@@ -753,7 +753,8 @@ export class AcpAgent implements Agent {
 
 	async authenticate(params: AuthenticateRequest): Promise<AuthenticateResponse> {
 		const methods = this.#clientCapabilities?.auth?.terminal ? ["agent", "terminal"] : ["agent"];
-		if (!methods.includes(params.methodId)) throw new Error(`Unknown ACP auth method: ${params.methodId}`);
+		if (!methods.includes(params.methodId))
+			throw new AcpSdkAdapterError("invalid_input", `Unknown ACP auth method: ${params.methodId}`);
 		return {};
 	}
 
@@ -920,7 +921,7 @@ export class AcpAgent implements Agent {
 
 	async setSessionMode(params: SetSessionModeRequest): Promise<SetSessionModeResponse> {
 		if (params.modeId !== ACP_DEFAULT_MODE_ID && params.modeId !== ACP_PLAN_MODE_ID)
-			throw new Error(`Unsupported ACP mode: ${params.modeId}`);
+			throw new AcpSdkAdapterError("invalid_input", `Unsupported ACP mode: ${params.modeId}`);
 		await this.#adapter(params.sessionId).control("mode.plan.set", { on: params.modeId === ACP_PLAN_MODE_ID });
 		await this.#publishSessionUpdate(params.sessionId, {
 			sessionId: params.sessionId,
@@ -931,7 +932,7 @@ export class AcpAgent implements Agent {
 
 	async setSessionConfigOption(params: SetSessionConfigOptionRequest): Promise<SetSessionConfigOptionResponse> {
 		if (typeof params.value !== "string")
-			throw new Error(`Unsupported boolean ACP config option: ${params.configId}`);
+			throw new AcpSdkAdapterError("invalid_input", `Unsupported boolean ACP config option: ${params.configId}`);
 		switch (params.configId) {
 			case MODE_CONFIG_ID:
 				await this.setSessionMode({ sessionId: params.sessionId, modeId: params.value });
@@ -948,7 +949,8 @@ export class AcpAgent implements Agent {
 				break;
 			default: {
 				const operation = ACP_CONFIG_CONTROL_OPERATIONS[params.configId];
-				if (!operation) throw new Error(`Unknown ACP config option: ${params.configId}`);
+				if (!operation)
+					throw new AcpSdkAdapterError("invalid_input", `Unknown ACP config option: ${params.configId}`);
 				await this.#adapter(params.sessionId).control(operation, { mode: params.value });
 			}
 		}
@@ -1890,12 +1892,14 @@ export class AcpAgent implements Agent {
 	#cursor(cursor: string | null | undefined): number {
 		if (!cursor) return 0;
 		const value = Number.parseInt(cursor, 10);
-		if (!Number.isSafeInteger(value) || value < 0) throw new Error(`Invalid ACP session cursor: ${cursor}`);
+		if (!Number.isSafeInteger(value) || value < 0)
+			throw new AcpSdkAdapterError("invalid_input", `Invalid ACP session cursor: ${cursor}`);
 		return value;
 	}
 
 	#assertAbsoluteCwd(cwd: string): void {
-		if (!path.isAbsolute(cwd)) throw new Error(`ACP cwd must be an absolute path: ${cwd}`);
+		if (!path.isAbsolute(cwd))
+			throw new AcpSdkAdapterError("invalid_input", `ACP cwd must be an absolute path: ${cwd}`);
 	}
 
 	#assertNoAdditionalDirectories(directories: string[] | null | undefined): void {
