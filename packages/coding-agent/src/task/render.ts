@@ -594,6 +594,10 @@ function renderAgentProgress(
 			)}`,
 		);
 	}
+	if (progress.setupFailure && progress.status !== "running") {
+		const summary = `Setup failure: ${truncateToWidth(replaceTabs(progress.setupFailure.summary), 80)}`;
+		lines.push(`${continuePrefix}${theme.tree.hook} ${theme.fg("error", summary)}`);
+	}
 
 	// Current tool (if running) or most recent completed tool
 	if (progress.status === "running") {

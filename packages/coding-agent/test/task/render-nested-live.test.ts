@@ -297,6 +297,17 @@ describe("task renderer: nested live rendering", () => {
 		expect(text).toContain("Requested model substituted: openai-codex/gpt-5.3-codex -> openai-codex/gpt-5.5");
 		expect(text).not.toContain("Model override substituted");
 	});
+	it("renders a terminal setup failure in live progress", async () => {
+		const text = await render(
+			makeRunningProgress({
+				id: "3-SetupFailure",
+				status: "failed",
+				setupFailure: { summary: "Credential bootstrap rejected." },
+			}),
+		);
+
+		expect(text).toContain("Setup failure: Credential bootstrap rejected.");
+	});
 
 	it("renders requested model substitution in final results", async () => {
 		const text = await renderResult({

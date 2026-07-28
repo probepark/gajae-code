@@ -34,6 +34,7 @@ export interface TaskResultReceipt {
 	usageCostBreakdownComplete?: true;
 	branchName?: string;
 	retryFailure?: { attempt: number; errorSummary: string };
+	setupFailure?: { summary: string };
 	errorSummary?: string;
 	abortSummary?: string;
 	preview: string;
@@ -103,6 +104,9 @@ function normalizeReviewFindingSeverity(severity: unknown, priority: unknown): s
 
 function buildSafeSynopsis(raw: SingleResult, outputRef: TaskResultReceipt["outputRef"]): string {
 	const status = getStatus(raw);
+	if (raw.setupFailure) {
+		return `Task ${status} during setup: ${raw.setupFailure.summary}`;
+	}
 	if (raw.modelSubstitutionWarning) {
 		return `Task ${status}; requested model substituted from ${raw.modelSubstitutionWarning.requested} to ${raw.modelSubstitutionWarning.effective}.`;
 	}
@@ -254,7 +258,8 @@ export function buildTaskReceipt(raw: SingleResult): TaskResultReceipt {
 		retryFailure: raw.retryFailure
 			? { attempt: raw.retryFailure.attempt, errorSummary: "Retry failure recorded." }
 			: undefined,
-		errorSummary: raw.error ? "Error recorded." : undefined,
+		errorSummary: raw.setupFailure?.summary ?? (raw.error ? "Error recorded." : undefined),
+		setupFailure: raw.setupFailure ? { summary: raw.setupFailure.summary } : undefined,
 		abortSummary: raw.abortReason ? "Abort reason recorded." : undefined,
 		preview,
 		previewTruncated: false,

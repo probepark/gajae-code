@@ -1,6 +1,7 @@
 # Changelog
 
 ## [Unreleased]
+- Subagent setup failures now retain a bounded, redacted cause through live progress, async snapshots, inspect/await, and terminal receipts instead of reporting an empty generic failure.
 
 ### Resume fixes
 

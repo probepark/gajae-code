@@ -56,11 +56,13 @@ import { persistTaskTokenLog, taskTokenLogFromUsage } from "./token-log";
 import {
 	type AgentDefinition,
 	type AgentProgress,
+	createSetupFailureSummary,
 	hasCompleteUsageCostBreakdown,
 	MAX_OUTPUT_BYTES,
 	MAX_OUTPUT_LINES,
 	type ModelSubstitutionWarning,
 	type ReviewFinding,
+	type SetupFailureSummary,
 	type SingleResult,
 	TASK_SUBAGENT_EVENT_CHANNEL,
 	TASK_SUBAGENT_LIFECYCLE_CHANNEL,
@@ -873,6 +875,7 @@ export async function runSubprocess(options: ExecutorOptions): Promise<SingleRes
 	let sessionEventOrdinal = 0;
 	let retryStartOrdinal = 0;
 	const seenAssistantMessages = new WeakSet<AgentMessage>();
+	let llmRequestStarted = false;
 	const seenAssistantMessageIdentities = new Set<string>();
 
 	// Accumulate usage incrementally from message_end events (no memory for streaming events)
@@ -1380,6 +1383,7 @@ export async function runSubprocess(options: ExecutorOptions): Promise<SingleRes
 		error?: string;
 		aborted?: boolean;
 		abortReason?: string;
+		setupFailure?: SetupFailureSummary;
 		durationMs: number;
 	}> => {
 		const sessionAbortController = new AbortController();
@@ -1387,6 +1391,7 @@ export async function runSubprocess(options: ExecutorOptions): Promise<SingleRes
 		let error: string | undefined;
 		let aborted = false;
 		let abortReasonText: string | undefined;
+		let setupFailure: SetupFailureSummary | undefined;
 		const checkAbort = () => {
 			if (abortSignal.aborted) {
 				aborted = abortReason === "signal" || runtimeLimitExceeded || abortReason === undefined;
@@ -1907,16 +1912,24 @@ export async function runSubprocess(options: ExecutorOptions): Promise<SingleRes
 				}
 			}
 			const runMode = options.runMode ?? "initial";
+			const markLlmRequestStarted = () => {
+				llmRequestStarted = true;
+			};
+			const promptOptions = {
+				attribution: "agent" as const,
+				// A prompt is an LLM request only after AgentSession accepts its
+				// preflight fence. Rejections remain setup failures.
+				onPreflightAccepted: markLlmRequestStarted,
+				onPreflightAcceptCommit: markLlmRequestStarted,
+			};
 			if (runMode === "message") {
-				await awaitAbortable(session.prompt(options.resumeMessage ?? "", { attribution: "agent" }));
+				await awaitAbortable(session.prompt(options.resumeMessage ?? "", promptOptions));
 				await awaitAbortable(session.waitForIdle());
 			} else if (runMode === "resume") {
-				await awaitAbortable(
-					session.prompt("Continue from the paused subagent session state.", { attribution: "agent" }),
-				);
+				await awaitAbortable(session.prompt("Continue from the paused subagent session state.", promptOptions));
 				await awaitAbortable(session.waitForIdle());
 			} else {
-				await awaitAbortable(session.prompt(task, { attribution: "agent" }));
+				await awaitAbortable(session.prompt(task, promptOptions));
 				await awaitAbortable(session.waitForIdle());
 			}
 
@@ -1993,6 +2006,7 @@ export async function runSubprocess(options: ExecutorOptions): Promise<SingleRes
 			exitCode = 1;
 			if (!abortSignal.aborted) {
 				error = err instanceof Error ? err.stack || err.message : String(err);
+				if (!llmRequestStarted) setupFailure = createSetupFailureSummary(err);
 			}
 		} finally {
 			if (abortSignal.aborted) {
@@ -2028,6 +2042,7 @@ export async function runSubprocess(options: ExecutorOptions): Promise<SingleRes
 			error,
 			aborted,
 			abortReason: aborted ? abortReasonText : undefined,
+			setupFailure,
 			durationMs: Date.now() - startTime,
 		};
 	};
@@ -2132,6 +2147,7 @@ export async function runSubprocess(options: ExecutorOptions): Promise<SingleRes
 				? yieldAbortReason
 				: (done.abortReason ?? (signal?.aborted ? resolveSignalAbortReason() : resolveAbortReasonText()))
 		: undefined;
+	progress.setupFailure = done.setupFailure;
 	progress.status = paused ? "paused" : wasAborted ? "aborted" : exitCode === 0 ? "completed" : "failed";
 	scheduleProgress(true);
 
@@ -2168,6 +2184,7 @@ export async function runSubprocess(options: ExecutorOptions): Promise<SingleRes
 		modelOverride,
 		modelSubstitutionWarning,
 		error: exitCode !== 0 && stderr ? stderr : undefined,
+		setupFailure: done.setupFailure,
 		aborted: wasAborted,
 		abortReason: finalAbortReason,
 		paused,
