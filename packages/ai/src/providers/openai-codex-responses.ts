@@ -718,9 +718,15 @@ async function buildTransformedCodexRequestBody(
 		params.service_tier = resolvedServiceTier;
 	}
 	if (context.tools && context.tools.length > 0) {
-		params.tools = convertOpenAICodexResponsesTools(context.tools, model);
-		if (options?.toolChoice) {
-			const resolvedToolChoice = resolveToolChoice(model, options.toolChoice);
+		const resolvedToolChoice = options?.toolChoice ? resolveToolChoice(model, options.toolChoice) : undefined;
+		const targetToolName = resolvedToolChoice?.targetToolName;
+		const requestTools = targetToolName
+			? context.tools.filter(tool => tool.name === targetToolName || tool.customWireName === targetToolName)
+			: context.tools;
+		if (requestTools.length > 0) {
+			params.tools = convertOpenAICodexResponsesTools(requestTools, model);
+		}
+		if (resolvedToolChoice) {
 			if (resolvedToolChoice.degraded && resolvedToolChoice.supportSource === "runtime") {
 				logCodexDebug("codex degraded tool_choice after runtime capability discovery", {
 					model: model.id,
@@ -729,8 +735,8 @@ async function buildTransformedCodexRequestBody(
 					reason: resolvedToolChoice.reason,
 				});
 			}
-			const toolChoice = normalizeCodexToolChoice(resolvedToolChoice.resolvedChoice, context.tools, model);
-			if (toolChoice) {
+			const toolChoice = normalizeCodexToolChoice(resolvedToolChoice.resolvedChoice, requestTools, model);
+			if (toolChoice && (!targetToolName || requestTools.length > 0)) {
 				params.tool_choice = toolChoice;
 			}
 		}
@@ -1514,7 +1520,6 @@ async function tryRetryWithoutForcedToolChoice(
 	error: unknown,
 ): Promise<boolean> {
 	if (
-		context.options?.fallbackManaged ||
 		runtime.providerRetryAttempt > 0 ||
 		context.output.content.length > 0 ||
 		context.firstTokenTime !== undefined ||
@@ -1847,7 +1852,6 @@ export const streamOpenAICodexResponses: StreamFunction<"openai-codex-responses"
 			try {
 				initialTransport = await openInitialCodexEventStream(model, options, requestSetup, requestContext);
 			} catch (error) {
-				if (options?.fallbackManaged) throw error;
 				initialTransport = await retryCodexInitialTransportWithoutToolChoice(
 					model,
 					options,

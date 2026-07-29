@@ -71,6 +71,10 @@ describe("OpenAI Codex responses tool choice capability", () => {
 	it("passes through named tool_choice when named choices are supported", async () => {
 		let payload: Record<string, unknown> | undefined;
 		const testModel = model({ compat: { toolChoiceSupport: "named" } });
+		const context = {
+			...testContext,
+			tools: [...testContext.tools!, { ...testContext.tools![0]!, name: "read" }],
+		};
 		global.fetch = Object.assign(
 			async (_input: string | URL | Request, init?: RequestInit) => {
 				payload = JSON.parse(String(init?.body ?? "{}")) as Record<string, unknown>;
@@ -78,12 +82,13 @@ describe("OpenAI Codex responses tool choice capability", () => {
 			},
 			{ preconnect: originalFetch.preconnect },
 		);
-		await streamOpenAICodexResponses(testModel, testContext, {
+		await streamOpenAICodexResponses(testModel, context, {
 			apiKey: codexToken,
 			preferWebsockets: false,
 			toolChoice: { type: "function", function: { name: "search" } },
 		}).result();
 		expect(payload?.tool_choice).toEqual({ type: "function", name: "search" });
+		expect(payload?.tools).toEqual([expect.objectContaining({ type: "function", name: "search" })]);
 	});
 
 	it("omits forced tool_choice but keeps tools when forced choices are unsupported", async () => {
@@ -140,24 +145,30 @@ describe("OpenAI Codex responses tool choice capability", () => {
 		expectSingleCleanFallbackEvents(events);
 	});
 
-	it("does not retry forced tool choice in managed mode", async () => {
+	it("retries forced tool choice without it in managed mode", async () => {
 		let calls = 0;
 		const testModel = model({ id: "managed-runtime-codex" });
 		global.fetch = Object.assign(
 			async () => {
 				calls += 1;
-				return createErrorResponse("tool_choice forces tool use is not compatible with this model");
+				return calls === 1
+					? createErrorResponse("tool_choice forces tool use is not compatible with this model")
+					: okResponse(testModel.id);
 			},
 			{ preconnect: originalFetch.preconnect },
 		);
-		const result = await streamOpenAICodexResponses(testModel, testContext, {
+		const stream = streamOpenAICodexResponses(testModel, testContext, {
 			apiKey: codexToken,
 			preferWebsockets: false,
 			toolChoice: { type: "function", function: { name: "search" } },
 			fallbackManaged: true,
-		}).result();
-		expect(calls).toBe(1);
-		expect(result.stopReason).toBe("error");
+		});
+		const events = await collectEvents(stream);
+		const result = await stream.result();
+		expect(calls).toBe(2);
+		expect(result.stopReason).toBe("stop");
+		expect(getToolChoiceCapabilityOverride(testModel)).toBe("auto");
+		expectSingleCleanFallbackEvents(events);
 	});
 
 	it("propagates unrelated 400 without retry or registry mark", async () => {
