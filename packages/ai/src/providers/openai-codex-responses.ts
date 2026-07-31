@@ -66,6 +66,7 @@ import {
 	toolWireSchema,
 } from "../utils/schema";
 import {
+	isCodexStatuslessNamedToolChoiceNotFoundError,
 	isForcedToolChoiceUnsupportedError,
 	markToolChoiceIncapability,
 	resolveToolChoice,
@@ -246,10 +247,9 @@ async function retryCodexInitialTransportWithoutToolChoice(
 	eventStream: AsyncGenerator<Record<string, unknown>>;
 	requestBodyForState: RequestBody;
 	transport: CodexTransport;
+	toolChoiceFallbackApplied: true;
 }> {
-	if (
-		!isForcedToolChoiceUnsupportedError(error, isForcedCodexToolChoice(requestContext.transformedBody.tool_choice))
-	) {
+	if (!isCodexForcedToolChoiceUnsupportedError(error, requestContext.transformedBody)) {
 		throw error;
 	}
 	const reason = await finalizeErrorMessage(error, requestContext.rawRequestDump);
@@ -273,7 +273,7 @@ async function retryCodexInitialTransportWithoutToolChoice(
 		requestContext.websocketState,
 	);
 	requestContext.rawRequestDump = { ...requestContext.rawRequestDump, body: next.requestBodyForState };
-	return next;
+	return { ...next, toolChoiceFallbackApplied: true };
 }
 
 interface CodexRequestSetup {
@@ -293,6 +293,8 @@ interface CodexStreamRuntime {
 	nativeOutputItems: Array<Record<string, unknown>>;
 	websocketStreamRetries: number;
 	providerRetryAttempt: number;
+	toolChoiceFallbackAttempted: boolean;
+	sseRequestBodyOverride?: RequestBody;
 	sawTerminalEvent: boolean;
 	canSafelyReplayWebsocketOverSse: boolean;
 	/** Ids of tool calls that received their terminal `output_item.done`. */
@@ -948,6 +950,7 @@ async function reopenCodexSseRuntimeStream(
 		context.requestSetup,
 		context.options,
 		state,
+		runtime.sseRequestBodyOverride,
 	);
 	runtime.eventStream = next.eventStream;
 	runtime.requestBodyForState = next.requestBodyForState;
@@ -962,6 +965,7 @@ function createCodexStreamRuntime(initial: {
 	requestBodyForState: RequestBody;
 	transport: CodexTransport;
 	websocketState?: CodexWebSocketSessionState;
+	toolChoiceFallbackApplied?: boolean;
 }): CodexStreamRuntime {
 	return {
 		eventStream: initial.eventStream,
@@ -973,6 +977,10 @@ function createCodexStreamRuntime(initial: {
 		nativeOutputItems: [],
 		websocketStreamRetries: 0,
 		providerRetryAttempt: 0,
+		toolChoiceFallbackAttempted: initial.toolChoiceFallbackApplied === true,
+		sseRequestBodyOverride: initial.toolChoiceFallbackApplied
+			? structuredCloneJSON(initial.requestBodyForState)
+			: undefined,
 		sawTerminalEvent: false,
 		canSafelyReplayWebsocketOverSse: true,
 		finalizedToolCallIds: new Set<string>(),
@@ -1521,11 +1529,11 @@ async function tryRetryWithoutForcedToolChoice(
 ): Promise<boolean> {
 	if (
 		context.options?.fallbackManaged ||
-		runtime.providerRetryAttempt > 0 ||
+		runtime.toolChoiceFallbackAttempted ||
 		context.output.content.length > 0 ||
 		context.firstTokenTime !== undefined ||
 		context.options?.signal?.aborted ||
-		!isForcedToolChoiceUnsupportedError(error, isForcedCodexToolChoice(runtime.requestBodyForState.tool_choice))
+		!isCodexForcedToolChoiceUnsupportedError(error, runtime.requestBodyForState)
 	) {
 		return false;
 	}
@@ -1544,7 +1552,7 @@ async function tryRetryWithoutForcedToolChoice(
 		registryKey: resolvedToolChoice.registryKey,
 	});
 
-	runtime.providerRetryAttempt += 1;
+	runtime.toolChoiceFallbackAttempted = true;
 	runtime.currentItem = null;
 	runtime.currentBlock = null;
 	runtime.sawTerminalEvent = false;
@@ -1566,6 +1574,7 @@ async function tryRetryWithoutForcedToolChoice(
 	);
 	runtime.eventStream = next.eventStream;
 	runtime.requestBodyForState = next.requestBodyForState;
+	runtime.sseRequestBodyOverride = next.requestBodyForState;
 	runtime.transport = next.transport;
 	if (websocketState) {
 		websocketState.lastTransport = next.transport;
@@ -1576,6 +1585,30 @@ async function tryRetryWithoutForcedToolChoice(
 
 function isForcedCodexToolChoice(choice: RequestBody["tool_choice"]): boolean {
 	return !!choice && choice !== "none" && choice !== "auto";
+}
+function isCodexForcedToolChoiceUnsupportedError(error: unknown, body: RequestBody): boolean {
+	if (isForcedToolChoiceUnsupportedError(error, isForcedCodexToolChoice(body.tool_choice))) {
+		return true;
+	}
+	return isCodexStatuslessNamedToolChoiceNotFoundError(
+		error,
+		codexNamedFunctionToolChoiceName(body.tool_choice),
+		codexSerializedToolNames(body.tools),
+	);
+}
+
+function codexNamedFunctionToolChoiceName(choice: RequestBody["tool_choice"]): string | undefined {
+	if (!choice || typeof choice !== "object") return undefined;
+	const namedChoice = choice as { type?: unknown; name?: unknown };
+	return namedChoice.type === "function" && typeof namedChoice.name === "string" ? namedChoice.name : undefined;
+}
+
+function codexSerializedToolNames(tools: RequestBody["tools"]): string[] {
+	if (!Array.isArray(tools)) return [];
+	return tools.flatMap(tool => {
+		const name = (tool as { name?: unknown }).name;
+		return typeof name === "string" ? [name] : [];
+	});
 }
 
 /**
@@ -1849,7 +1882,9 @@ export const streamOpenAICodexResponses: StreamFunction<"openai-codex-responses"
 
 		try {
 			const requestContext = await buildCodexRequestContext(model, context, options, output);
-			let initialTransport: Awaited<ReturnType<typeof openInitialCodexEventStream>>;
+			let initialTransport: Awaited<ReturnType<typeof openInitialCodexEventStream>> & {
+				toolChoiceFallbackApplied?: boolean;
+			};
 			try {
 				initialTransport = await openInitialCodexEventStream(model, options, requestSetup, requestContext);
 			} catch (error) {
