@@ -23,6 +23,10 @@
 
 - Updated GPT-5.6 Sol, Terra, and Luna to current OpenAI Standard pricing, including Responses API cache-write attribution and full-request long-context pricing above 272K input tokens.
 
+### Fixed
+
+- Codex statusless HTTP 200 SSE `invalid_request_error` events retry once without a forced named function choice only when the exact rejected name is still present in the request's serialized tools, before any output is emitted (#3669).
+
 ## [0.12.7] - 2026-07-31
 
 ## [0.12.6] - 2026-07-31
