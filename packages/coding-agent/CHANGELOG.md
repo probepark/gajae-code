@@ -8,6 +8,7 @@
 ### Fixed
 
 - A failed `notify setup` no longer reports "Unable to persist and activate Telegram notification settings" when the durable configuration already carries the attempted bot token, chat id, and enabled state. The wording now follows the stored configuration, so it can no longer contradict a follow-up `notify status`; an operator who reads the failure as "nothing was saved" would otherwise leave Telegram armed for a token another poller may own. A commit that was entered and then failed while the stored configuration is also unreadable is reported as undecided, pointing at `notify status`, instead of guessing either outcome (#3761).
+- Deferred composer shell results now commit to the session transcript before terminal turn publication, reconcile uncertain append outcomes by exact entry id, and retire only the matching live display during transcript rebuilds so persisted executions are neither lost nor duplicated (#3639).
 
 ## [0.12.11] - 2026-08-03
 

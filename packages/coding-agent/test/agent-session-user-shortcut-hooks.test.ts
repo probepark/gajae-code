@@ -2,6 +2,7 @@ import { afterEach, beforeEach, describe, expect, it, vi } from "bun:test";
 import * as path from "node:path";
 import { Agent } from "@gajae-code/agent-core";
 import { getBundledModel } from "@gajae-code/ai";
+import { createMockModel } from "@gajae-code/ai/providers/mock";
 import { ModelRegistry } from "@gajae-code/coding-agent/config/model-registry";
 import { Settings } from "@gajae-code/coding-agent/config/settings";
 import * as pythonExecutor from "@gajae-code/coding-agent/eval/py/executor";
@@ -9,7 +10,7 @@ import * as bashExecutor from "@gajae-code/coding-agent/exec/bash-executor";
 import type { ExtensionRunner } from "@gajae-code/coding-agent/extensibility/extensions";
 import { AgentSession } from "@gajae-code/coding-agent/session/agent-session";
 import { AuthStorage } from "@gajae-code/coding-agent/session/auth-storage";
-import { SessionManager } from "@gajae-code/coding-agent/session/session-manager";
+import { SessionAppendPersistenceError, SessionManager } from "@gajae-code/coding-agent/session/session-manager";
 import { TempDir } from "@gajae-code/utils";
 
 describe("AgentSession user shortcut hooks", () => {
@@ -93,7 +94,266 @@ describe("AgentSession user shortcut hooks", () => {
 			excludeFromContext: true,
 		});
 	});
+	it("reconciles an immediate shell result that committed before append failure", async () => {
+		const replacement = {
+			output: "hooked bash output",
+			exitCode: 0,
+			cancelled: false,
+			truncated: false,
+			totalLines: 1,
+			totalBytes: 18,
+			outputLines: 1,
+			outputBytes: 18,
+		};
+		const extensionRunner = {
+			hasHandlers: vi.fn((eventType: string) => eventType === "user_bash"),
+			emitUserBash: vi.fn().mockResolvedValue({ result: replacement }),
+		} as unknown as ExtensionRunner;
+		createSession(extensionRunner);
+		const manager = session.sessionManager;
+		const appendMessage = manager.appendMessage.bind(manager);
+		let injected = false;
+		vi.spyOn(manager, "appendMessage").mockImplementation(message => {
+			if (!injected && message.role === "bashExecution") {
+				injected = true;
+				const entryId = appendMessage(message);
+				throw new SessionAppendPersistenceError("current_append", entryId, new Error("uncertain append"));
+			}
+			return appendMessage(message);
+		});
+		vi.spyOn(manager, "recoverPersistenceFailure").mockResolvedValue();
 
+		const result = await session.executeBash("echo hello");
+
+		expect(result).toEqual(replacement);
+		expect(
+			manager.getBranch().filter(entry => entry.type === "message" && entry.message.role === "bashExecution"),
+		).toHaveLength(1);
+		expect(session.messages.filter(message => message.role === "bashExecution")).toHaveLength(1);
+	});
+	it("persists deferred shell results before terminal publication", async () => {
+		const model = getBundledModel("anthropic", "claude-sonnet-4-5");
+		if (!model) throw new Error("Expected claude-sonnet-4-5 model to exist");
+		authStorage?.setRuntimeApiKey("anthropic", "test-key");
+		const mock = createMockModel({ handler: () => ({ content: ["Done"] }) });
+		const agent = new Agent({
+			getApiKey: () => "test-key",
+			initialState: { model, systemPrompt: ["Test"], tools: [], messages: [] },
+			streamFn: mock.stream,
+		});
+		session = new AgentSession({
+			agent,
+			sessionManager: SessionManager.inMemory(),
+			settings: Settings.isolated({ "compaction.enabled": false }),
+			modelRegistry,
+		});
+		const result = {
+			output: "done",
+			exitCode: 0,
+			cancelled: false,
+			truncated: false,
+			totalLines: 1,
+			totalBytes: 4,
+			outputLines: 1,
+			outputBytes: 4,
+		};
+		const displayIdentity = {};
+		let durableBeforePublication = false;
+		const unsubscribeRaw = agent.subscribe(event => {
+			if (event.type === "agent_end") void session.recordBashResult("deferred", result, { displayIdentity });
+		});
+		const published = Promise.withResolvers<void>();
+		const unsubscribe = session.subscribe(event => {
+			if (event.type !== "agent_end") return;
+			const entryId = session.getBashExecutionEntryId(displayIdentity);
+			durableBeforePublication =
+				entryId !== undefined &&
+				session.sessionManager
+					.getBranch()
+					.some(
+						entry => entry.id === entryId && entry.type === "message" && entry.message.role === "bashExecution",
+					);
+			published.resolve();
+		});
+
+		await session.prompt("Finish the turn");
+		await published.promise;
+		unsubscribeRaw();
+		unsubscribe();
+
+		expect(durableBeforePublication).toBe(true);
+		expect(session.hasPendingBashMessages).toBe(false);
+		expect(session.messages.filter(message => message.role === "bashExecution")).toHaveLength(1);
+	});
+	it("reconciles a deferred shell result that committed before append failure", async () => {
+		const model = getBundledModel("anthropic", "claude-sonnet-4-5");
+		if (!model) throw new Error("Expected claude-sonnet-4-5 model to exist");
+		authStorage?.setRuntimeApiKey("anthropic", "test-key");
+		const mock = createMockModel({ handler: () => ({ content: ["Done"] }) });
+		const agent = new Agent({
+			getApiKey: () => "test-key",
+			initialState: { model, systemPrompt: ["Test"], tools: [], messages: [] },
+			streamFn: mock.stream,
+		});
+		session = new AgentSession({
+			agent,
+			sessionManager: SessionManager.inMemory(),
+			settings: Settings.isolated({ "compaction.enabled": false }),
+			modelRegistry,
+		});
+		const manager = session.sessionManager;
+		const appendMessage = manager.appendMessage.bind(manager);
+		let injected = false;
+		vi.spyOn(manager, "appendMessage").mockImplementation(message => {
+			if (!injected && message.role === "bashExecution") {
+				injected = true;
+				const entryId = appendMessage(message);
+				throw new SessionAppendPersistenceError("current_append", entryId, new Error("uncertain append"));
+			}
+			return appendMessage(message);
+		});
+		vi.spyOn(manager, "recoverPersistenceFailure").mockResolvedValue();
+		const result = {
+			output: "done",
+			exitCode: 0,
+			cancelled: false,
+			truncated: false,
+			totalLines: 1,
+			totalBytes: 4,
+			outputLines: 1,
+			outputBytes: 4,
+		};
+		const unsubscribe = agent.subscribe(event => {
+			if (event.type === "agent_end") void session.recordBashResult("deferred", result);
+		});
+
+		await session.prompt("Finish the turn");
+		unsubscribe();
+
+		expect(
+			manager.getBranch().filter(entry => entry.type === "message" && entry.message.role === "bashExecution"),
+		).toHaveLength(1);
+		expect(session.messages.filter(message => message.role === "bashExecution")).toHaveLength(1);
+		expect(session.hasPendingBashMessages).toBe(false);
+	});
+
+	it("reconciles a retry that commits after the first append was proven absent", async () => {
+		const model = getBundledModel("anthropic", "claude-sonnet-4-5");
+		if (!model) throw new Error("Expected claude-sonnet-4-5 model to exist");
+		authStorage?.setRuntimeApiKey("anthropic", "test-key");
+		const mock = createMockModel({ handler: () => ({ content: ["Done"] }) });
+		const agent = new Agent({
+			getApiKey: () => "test-key",
+			initialState: { model, systemPrompt: ["Test"], tools: [], messages: [] },
+			streamFn: mock.stream,
+		});
+		session = new AgentSession({
+			agent,
+			sessionManager: SessionManager.inMemory(),
+			settings: Settings.isolated({ "compaction.enabled": false }),
+			modelRegistry,
+		});
+		const manager = session.sessionManager;
+		const appendMessage = manager.appendMessage.bind(manager);
+		let bashAppendAttempts = 0;
+		vi.spyOn(manager, "appendMessage").mockImplementation(message => {
+			if (message.role !== "bashExecution") return appendMessage(message);
+			bashAppendAttempts++;
+			if (bashAppendAttempts === 1) {
+				throw new SessionAppendPersistenceError("current_append", "not-committed", new Error("known failure"));
+			}
+			const entryId = appendMessage(message);
+			throw new SessionAppendPersistenceError("current_append", entryId, new Error("uncertain retry"));
+		});
+		vi.spyOn(manager, "recoverPersistenceFailure").mockResolvedValue();
+		const result = {
+			output: "done",
+			exitCode: 0,
+			cancelled: false,
+			truncated: false,
+			totalLines: 1,
+			totalBytes: 4,
+			outputLines: 1,
+			outputBytes: 4,
+		};
+		const unsubscribe = agent.subscribe(event => {
+			if (event.type === "agent_end") void session.recordBashResult("deferred", result);
+		});
+
+		await session.prompt("Finish the turn");
+		unsubscribe();
+
+		expect(bashAppendAttempts).toBe(2);
+		expect(
+			manager.getBranch().filter(entry => entry.type === "message" && entry.message.role === "bashExecution"),
+		).toHaveLength(1);
+		expect(session.messages.filter(message => message.role === "bashExecution")).toHaveLength(1);
+		expect(session.hasPendingBashMessages).toBe(false);
+	});
+	it("retries a failed terminal publication without losing the deferred shell result", async () => {
+		const model = getBundledModel("anthropic", "claude-sonnet-4-5");
+		if (!model) throw new Error("Expected claude-sonnet-4-5 model to exist");
+		authStorage?.setRuntimeApiKey("anthropic", "test-key");
+		const mock = createMockModel({ handler: () => ({ content: ["Done"] }) });
+		const agent = new Agent({
+			getApiKey: () => "test-key",
+			initialState: { model, systemPrompt: ["Test"], tools: [], messages: [] },
+			streamFn: mock.stream,
+		});
+		session = new AgentSession({
+			agent,
+			sessionManager: SessionManager.inMemory(),
+			settings: Settings.isolated({ "compaction.enabled": false }),
+			modelRegistry,
+		});
+		const manager = session.sessionManager;
+		const appendMessage = manager.appendMessage.bind(manager);
+		let bashAppendAttempts = 0;
+		vi.spyOn(manager, "appendMessage").mockImplementation(message => {
+			if (message.role !== "bashExecution") return appendMessage(message);
+			bashAppendAttempts++;
+			if (bashAppendAttempts <= 2) {
+				throw new SessionAppendPersistenceError(
+					"current_append",
+					`not-committed-${bashAppendAttempts}`,
+					new Error("known failure"),
+				);
+			}
+			return appendMessage(message);
+		});
+		const recover = vi
+			.spyOn(manager, "recoverPersistenceFailure")
+			.mockRejectedValueOnce(new Error("rehydration unavailable"))
+			.mockRejectedValueOnce(new Error("rehydration still unavailable"))
+			.mockResolvedValue();
+		const result = {
+			output: "done",
+			exitCode: 0,
+			cancelled: false,
+			truncated: false,
+			totalLines: 1,
+			totalBytes: 4,
+			outputLines: 1,
+			outputBytes: 4,
+		};
+		const unsubscribe = agent.subscribe(event => {
+			if (event.type === "agent_end") void session.recordBashResult("deferred", result);
+		});
+
+		await expect(session.prompt("First turn")).rejects.toThrow("rehydration still unavailable");
+		unsubscribe();
+		expect(session.hasPendingBashMessages).toBe(true);
+
+		await session.prompt("Second turn");
+
+		expect(recover).toHaveBeenCalledTimes(2);
+		expect(bashAppendAttempts).toBe(3);
+		expect(
+			manager.getBranch().filter(entry => entry.type === "message" && entry.message.role === "bashExecution"),
+		).toHaveLength(1);
+		expect(session.messages.filter(message => message.role === "bashExecution")).toHaveLength(1);
+		expect(session.hasPendingBashMessages).toBe(false);
+	});
 	it("invokes user_python hook and honors replacement result", async () => {
 		const replacement = {
 			output: "hooked python output",

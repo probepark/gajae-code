@@ -1932,7 +1932,8 @@ export class AgentSession {
 
 	// Bash execution state
 	#bashAbortControllers = new Set<AbortController>();
-	#pendingBashMessages: BashExecutionMessage[] = [];
+	#pendingBashMessages: Array<{ message: BashExecutionMessage; displayIdentity?: object }> = [];
+	#bashExecutionEntryIds = new WeakMap<object, string>();
 	#foregroundBashBackgroundRequestHandler: (() => void) | undefined;
 
 	// Python execution state
@@ -2513,6 +2514,18 @@ export class AgentSession {
 		this.#agentEndPublicationPromise = this.#publishDeferredAgentEnd(pending, lease);
 		void this.#agentEndPublicationPromise;
 	}
+	async #awaitAgentEndPublication(): Promise<void> {
+		try {
+			await this.#agentEndPublicationPromise;
+		} catch (error) {
+			const pending = this.#pendingAgentEndEmit;
+			if (!pending) throw error;
+			this.#agentEndPublicationPromise = Promise.resolve();
+			this.#flushPendingAgentEnd();
+			if (this.#pendingAgentEndEmit === pending) throw error;
+			await this.#agentEndPublicationPromise;
+		}
+	}
 
 	async #publishDeferredAgentEnd(
 		pending: AgentSessionEvent,
@@ -2531,6 +2544,15 @@ export class AgentSession {
 			// hook. Make it durable before publishing the terminal boundary while user
 			// extension delivery remains asynchronous.
 			await this.#flushWorkerIntegrationForAgentEnd();
+			// Deferred shell results must be durable before terminal UI subscribers can
+			// rebuild from the transcript. A failed append can have committed before
+			// reporting an uncertain outcome, so reconcile the exact entry before retrying.
+			try {
+				await this.#flushPendingBashMessages();
+			} catch (error) {
+				this.agent.abort();
+				throw error;
+			}
 			// Persist before notifying synchronous subscribers: a subscriber may start a
 			// successor prompt from agent_end, whose running state must serialize after
 			// this terminal boundary rather than be overwritten by it.
@@ -2543,12 +2565,22 @@ export class AgentSession {
 				(pending as AgentSessionEvent & { scope?: AttemptScopeRef }).scope,
 			);
 		};
+		let published = false;
 		try {
 			if (lease) await this.#runResourceLeaseContext.run(lease, publish);
 			else await publish();
+			published = true;
+		} catch (error) {
+			if (!this.#pendingAgentEndEmit) {
+				this.#pendingAgentEndEmit = pending;
+				if (lease) this.#deferredAgentEndLeases.set(pending, lease);
+			}
+			throw error;
 		} finally {
-			if (extensionDelivery) void extensionDelivery.then(releaseLease, releaseLease);
-			else releaseLease();
+			if (published) {
+				if (extensionDelivery) void extensionDelivery.then(releaseLease, releaseLease);
+				else releaseLease();
+			}
 			this.#agentEndPublicationInFlight = Math.max(0, this.#agentEndPublicationInFlight - 1);
 			this.#resolveSessionSettlement();
 		}
@@ -5973,7 +6005,7 @@ export class AgentSession {
 			}
 		}
 		await admissionClosed;
-		await this.#agentEndPublicationPromise;
+		await this.#awaitAgentEndPublication();
 		await this.#queuedExtensionEvents;
 		this.#workflowGateEmitter?.fence?.();
 		this.#pendingBackgroundExchanges = [];
@@ -8503,7 +8535,7 @@ export class AgentSession {
 		},
 	): Promise<void> {
 		this.#assertNoHandoffTransition();
-		await this.#agentEndPublicationPromise;
+		await this.#awaitAgentEndPublication();
 		// Re-check after the publication await: a handoff can engage during that
 		// window, and #beginInFlight below would otherwise start a turn against the
 		// session being handed off.
@@ -8528,7 +8560,7 @@ export class AgentSession {
 				this.#throwIfPromptPreflightCancelled(generation, preflightSignal);
 			}
 			// Flush any pending bash messages before the new prompt
-			this.#flushPendingBashMessages();
+			await this.#flushPendingBashMessages();
 			this.#flushPendingPythonMessages();
 			this.#flushPendingBackgroundExchanges();
 
@@ -8778,11 +8810,11 @@ export class AgentSession {
 			this.#releaseDeferredAgentEndContinuation(predecessorAgentEndHold);
 			this.#endInFlight();
 			if (options?.skipPostPromptRecoveryWait) {
-				await this.#agentEndPublicationPromise;
+				await this.#awaitAgentEndPublication();
 			} else {
 				await this.#agentEndHandlingPromise;
 				await this.#waitForPostPromptRecovery();
-				await this.#agentEndPublicationPromise;
+				await this.#awaitAgentEndPublication();
 			}
 		}
 	}
@@ -15350,7 +15382,7 @@ export class AgentSession {
 	async executeBash(
 		command: string,
 		onChunk?: (chunk: string) => void,
-		options?: { excludeFromContext?: boolean },
+		options?: { excludeFromContext?: boolean; displayIdentity?: object },
 	): Promise<BashResult> {
 		const excludeFromContext = options?.excludeFromContext === true;
 		this.#markRetryReplayUnsafe();
@@ -15365,7 +15397,7 @@ export class AgentSession {
 				cwd,
 			});
 			if (hookResult?.result) {
-				this.recordBashResult(command, hookResult.result, options);
+				await this.recordBashResult(command, hookResult.result, options);
 				if (hookResult.result.exitCode === 0 && !hookResult.result.cancelled) {
 					await this.#activatePendingGjcGoalModeRequest();
 				}
@@ -15391,7 +15423,7 @@ export class AgentSession {
 				onMinimizedSave: originalText => this.#saveBashOriginalArtifact(originalText),
 			});
 
-			this.recordBashResult(command, result, options);
+			await this.recordBashResult(command, result, options);
 			if (result.exitCode === 0 && !result.cancelled) {
 				await this.#activatePendingGjcGoalModeRequest();
 			}
@@ -15405,7 +15437,11 @@ export class AgentSession {
 	 * Record a bash execution result in session history.
 	 * Used by executeBash and by extensions that handle bash execution themselves.
 	 */
-	recordBashResult(command: string, result: BashResult, options?: { excludeFromContext?: boolean }): void {
+	async recordBashResult(
+		command: string,
+		result: BashResult,
+		options?: { excludeFromContext?: boolean; displayIdentity?: object },
+	): Promise<void> {
 		const meta = outputMeta().truncationFromSummary(result, { direction: "tail" }).get();
 		const bashMessage: BashExecutionMessage = {
 			role: "bashExecution",
@@ -15419,17 +15455,12 @@ export class AgentSession {
 			excludeFromContext: options?.excludeFromContext,
 		};
 
-		// If agent is streaming, defer adding to avoid breaking tool_use/tool_result ordering
+		// If agent is streaming, defer adding to avoid breaking tool_use/tool_result ordering.
 		if (this.isStreaming) {
-			// Queue for later - will be flushed on agent_end
-			this.#pendingBashMessages.push(bashMessage);
-		} else {
-			// Add to agent state immediately
-			this.agent.appendMessage(bashMessage);
-
-			// Save to session
-			this.sessionManager.appendMessage(bashMessage);
+			this.#pendingBashMessages.push({ message: bashMessage, displayIdentity: options?.displayIdentity });
+			return;
 		}
+		await this.#appendBashMessageDurably({ message: bashMessage, displayIdentity: options?.displayIdentity });
 	}
 
 	/**
@@ -15452,21 +15483,52 @@ export class AgentSession {
 	}
 
 	/**
-	 * Flush pending bash messages to agent state and session.
-	 * Called after agent turn completes to maintain proper message ordering.
+	 * Return the durable transcript entry associated with a live shell display.
+	 * The identity is process-local; the entry id is the stable cross-rebuild key.
 	 */
-	#flushPendingBashMessages(): void {
-		if (this.#pendingBashMessages.length === 0) return;
+	getBashExecutionEntryId(displayIdentity: object): string | undefined {
+		return this.#bashExecutionEntryIds.get(displayIdentity);
+	}
 
-		for (const bashMessage of this.#pendingBashMessages) {
-			// Add to agent state
-			this.agent.appendMessage(bashMessage);
-
-			// Save to session
-			this.sessionManager.appendMessage(bashMessage);
+	async #appendBashMessageDurably(pending: {
+		message: BashExecutionMessage;
+		displayIdentity?: object;
+	}): Promise<void> {
+		for (let attempt = 0; attempt < 2; attempt++) {
+			try {
+				const entryId = this.sessionManager.appendMessage(pending.message);
+				if (pending.displayIdentity) this.#bashExecutionEntryIds.set(pending.displayIdentity, entryId);
+				this.agent.appendMessage(pending.message);
+				return;
+			} catch (error) {
+				if (!(error instanceof SessionAppendPersistenceError) || error.phase !== "current_append") throw error;
+				await this.sessionManager.recoverPersistenceFailure();
+				const durableEntry = this.sessionManager
+					.getBranch()
+					.find(
+						entry =>
+							entry.id === error.entryId && entry.type === "message" && entry.message.role === "bashExecution",
+					);
+				if (durableEntry?.type === "message" && durableEntry.message.role === "bashExecution") {
+					if (pending.displayIdentity) this.#bashExecutionEntryIds.set(pending.displayIdentity, durableEntry.id);
+					this.agent.appendMessage(durableEntry.message);
+					return;
+				}
+				if (attempt === 1) throw error;
+			}
 		}
+	}
 
-		this.#pendingBashMessages = [];
+	/**
+	 * Flush pending bash messages to agent state and session.
+	 * Called before terminal agent_end publication to maintain proper message ordering.
+	 */
+	async #flushPendingBashMessages(): Promise<void> {
+		while (this.#pendingBashMessages.length > 0) {
+			const pending = this.#pendingBashMessages[0];
+			await this.#appendBashMessageDurably(pending);
+			this.#pendingBashMessages.shift();
+		}
 	}
 
 	// =========================================================================
