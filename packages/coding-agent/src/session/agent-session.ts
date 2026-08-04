@@ -7561,7 +7561,10 @@ export class AgentSession {
 	async invokeSkill(
 		name: string,
 		args = "",
-		options?: Pick<PromptOptions, "onPreflightAccepted" | "onPreflightAcceptCommit" | "onSkillPrepared">,
+		options?: Pick<
+			PromptOptions,
+			"onPreflightAccepted" | "onPreflightAcceptCommit" | "onSkillPrepared" | "streamingBehavior"
+		>,
 	): Promise<{ name: string; path: string; args?: string; lineCount?: number }> {
 		const skillName = name.trim();
 		if (!skillName) throw Object.assign(new Error("skill.invoke requires a skill name."), { code: "invalid_input" });

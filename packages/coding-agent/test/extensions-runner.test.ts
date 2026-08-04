@@ -1020,12 +1020,18 @@ describe("ExtensionRunner", () => {
 				modelRegistry,
 			);
 			const earlyContext = wired.createContext();
+			const workflowGate = {
+				supportsRemoteGateAnswers: () => true,
+				emitGate: async () => undefined,
+			};
 			expect("runEphemeralTurn" in earlyContext).toBe(false);
 			wired.initialize(runtimeActions, {
 				...baseContextActions,
 				getPendingMessageCounts: () => ({ steering: 2, followUp: 1, nextTurn: 3 }),
+				getWorkflowGate: () => workflowGate,
 			});
 			expect(wired.createContext().getPendingMessageCounts()).toEqual({ steering: 2, followUp: 1, nextTurn: 3 });
+			expect(earlyContext.workflowGate).toBe(workflowGate);
 
 			// Omitted: every initialize applies the explicit zero fallback, never a stale provider.
 			wired.initialize(runtimeActions, baseContextActions);

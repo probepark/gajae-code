@@ -87,6 +87,46 @@ describe("SDK query pagination", () => {
 		});
 		expect(rejected.page).toBeUndefined();
 	});
+	it("honors bounded item limits across transcript cursors", async () => {
+		const transcript = Array.from({ length: 205 }, (_, index) => ({
+			id: `message-${index}`,
+			role: index % 2 === 0 ? "user" : "assistant",
+			body: `body-${index}`,
+		}));
+		const query = handlers(transcript);
+		const first = await query.handlers.dispatch({
+			query: "transcript.list",
+			input: { limit: 100 },
+			connectionId: "c",
+		});
+		expect(first.page).toMatchObject({ complete: false });
+		expect(first.page?.items).toHaveLength(100);
+
+		const mismatched = await query.handlers.dispatch({
+			query: "transcript.list",
+			input: { limit: 99 },
+			cursor: first.page?.continuationCursor,
+			connectionId: "c",
+		});
+		expect(mismatched.error?.code).toBe("invalid_input");
+
+		const second = await query.handlers.dispatch({
+			query: "transcript.list",
+			input: { limit: 100 },
+			cursor: first.page?.continuationCursor,
+			connectionId: "c",
+		});
+		expect(second.page?.items).toHaveLength(100);
+		const third = await query.handlers.dispatch({
+			query: "transcript.list",
+			input: { limit: 100 },
+			cursor: second.page?.continuationCursor,
+			connectionId: "c",
+		});
+		expect(third.page).toMatchObject({ complete: true });
+		expect(third.page?.items).toHaveLength(5);
+		await query.store.close();
+	});
 
 	it("keeps Q29 continuation order and snapshot contents after the surface mutates", async () => {
 		const initialProviders: ActiveProviderDescriptor[] = [

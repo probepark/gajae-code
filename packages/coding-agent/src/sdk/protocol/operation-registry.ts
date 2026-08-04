@@ -148,6 +148,7 @@ const queries = [
 	["session.branch_candidates", "List branch candidates."],
 	["session.last_assistant", "Read the last assistant message."],
 	["runtime.capabilities", "Read runtime capabilities."],
+	["runtime.authority", "Read the authenticated session endpoint authority tuple."],
 	["auth.providers", "List authentication provider status without credentials."],
 	["tools.list", "List tools."],
 	["queue.messages.list", "List queued messages."],

@@ -18,6 +18,10 @@ export interface ClientBridgeCapabilities {
 	terminal?: boolean;
 	/** Client implements `session/request_permission`. */
 	requestPermission?: boolean;
+	/** Client implements session-scoped host URI reads. */
+	readHostUri?: boolean;
+	/** Client implements session-scoped host URI writes. */
+	writeHostUri?: boolean;
 }
 
 export interface ClientBridgePermissionToolCall {
@@ -76,6 +80,13 @@ export interface ClientBridge {
 	readonly deferAgentInitiatedTurns?: boolean;
 	readTextFile?(params: { path: string; line?: number; limit?: number }): Promise<string>;
 	writeTextFile?(params: { path: string; content: string }): Promise<void>;
+	readHostUri?(params: { uri: string; signal?: AbortSignal }): Promise<{
+		content: string;
+		contentType: "text/markdown" | "application/json" | "text/plain";
+		notes?: string[];
+		immutable: boolean;
+	}>;
+	writeHostUri?(params: { uri: string; content: string; signal?: AbortSignal }): Promise<void>;
 	createTerminal?(params: ClientBridgeCreateTerminalParams): Promise<ClientBridgeTerminalHandle>;
 	requestPermission?(
 		toolCall: ClientBridgePermissionToolCall,

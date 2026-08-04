@@ -33,6 +33,7 @@ export interface SessionSurface {
 	getBranchCandidates(): unknown | Promise<unknown>;
 	getLastAssistant(): unknown | Promise<unknown>;
 	getCapabilities(): unknown | Promise<unknown>;
+	getAuthority?(connectionId: string): unknown | Promise<unknown>;
 	getAuthProviders(): unknown | Promise<unknown>;
 	getTools(): unknown | Promise<unknown>;
 	getQueueMessages(): unknown | Promise<unknown>;
@@ -100,6 +101,7 @@ const sources: Record<string, { resource: string; method: keyof SessionSurface; 
 	Q16: { resource: "branches", method: "getBranchCandidates", mvcc: false },
 	Q17: { resource: "lastAssistant", method: "getLastAssistant", mvcc: false },
 	Q18: { resource: "capabilities", method: "getCapabilities", mvcc: false },
+	Q30: { resource: "authority", method: "getAuthority", mvcc: false },
 	Q19: { resource: "auth", method: "getAuthProviders", mvcc: false },
 	Q20: { resource: "tools", method: "getTools", mvcc: true },
 	Q21: { resource: "queue", method: "getQueueMessages", mvcc: true },
@@ -138,6 +140,7 @@ const names = [
 	"models.profiles.list",
 	"skill.invoke_status",
 	"providers.list/active",
+	"runtime.authority",
 ];
 
 export class QueryHandlers {
@@ -182,6 +185,13 @@ export class QueryHandlers {
 				);
 			if (query === "Q29" && typeof this.surface.getActiveProviders !== "function")
 				return this.#error(request, "unavailable", false, "providers.list/active is unavailable for this session.");
+			if (query === "Q30") {
+				if (request.input && Object.keys(request.input).some(key => key !== "expectedConnectionEpoch"))
+					return this.#error(request, "invalid_request", false, "runtime.authority received unsupported input fields.");
+				if (typeof this.surface.getAuthority !== "function")
+					return this.#error(request, "unavailable", false, "runtime.authority is unavailable for this session.");
+				return { id: request.id, ok: true, result: await this.surface.getAuthority(request.connectionId) };
+			}
 			const source = sources[query];
 			if (!source) return this.#error(request, "invalid_request");
 			return await this.#pageSource(request, query, source);
@@ -198,6 +208,8 @@ export class QueryHandlers {
 		source: { resource: string; method: keyof SessionSurface; mvcc: boolean },
 	): Promise<QueryResponse> {
 		let selector = selectorFor(queryId, request.input);
+		const maxItems = pageItemLimit(request.input);
+		const pageShape = { targetBytes: TARGET_PAGE_BYTES, ...(maxItems !== undefined ? { maxItems } : {}) };
 		let resourceId = selector.resourceId ?? "default";
 		let revision: string;
 		let position = 0;
@@ -208,14 +220,14 @@ export class QueryHandlers {
 				sessionId: this.sessionId,
 				resource: source.resource,
 				direction: "forward",
-				pageShape: { targetBytes: TARGET_PAGE_BYTES },
+				pageShape,
 			});
 			selector = assertCursorSelector(cursorSelector(cursor.position), selector);
 			resourceId = selector.resourceId ?? "default";
 			revision = cursor.revision;
 			position = Number((cursor.position as CursorPosition).offset ?? 0);
 			byteOffset = Number((cursor.position as CursorPosition).byteOffset ?? 0);
-			const page = await this.revisions.readPage(source.resource, resourceId, revision, position, TARGET_PAGE_BYTES);
+			const page = await this.revisions.readPage(source.resource, resourceId, revision, position, TARGET_PAGE_BYTES, maxItems);
 			if (page) {
 				if (page.items.length === 0 && !page.complete) {
 					const item = await this.revisions.describeIndexedItem(source.resource, resourceId, revision, position);
@@ -239,6 +251,7 @@ export class QueryHandlers {
 						position,
 						selector,
 						source.resource === "transcript" ? { highWatermark: cursor.highWatermark } : {},
+						maxItems,
 					);
 				}
 				return this.#paginateIndexed(
@@ -251,6 +264,7 @@ export class QueryHandlers {
 					position,
 					selector,
 					source.resource === "transcript" ? { highWatermark: cursor.highWatermark } : {},
+					maxItems,
 				);
 			}
 			const range = await this.revisions.readRootRange(
@@ -281,7 +295,7 @@ export class QueryHandlers {
 		}
 		if (snapshot === undefined) return this.#error(request, "resource_gone");
 		if (Array.isArray(snapshot)) {
-			const page = await this.revisions.readPage(source.resource, resourceId, revision, 0, TARGET_PAGE_BYTES);
+			const page = await this.revisions.readPage(source.resource, resourceId, revision, 0, TARGET_PAGE_BYTES, maxItems);
 			if (page?.items.length === 0 && !page.complete) {
 				const item = await this.revisions.describeIndexedItem(source.resource, resourceId, revision, 0);
 				const continuations = item?.itemId
@@ -304,6 +318,7 @@ export class QueryHandlers {
 					0,
 					selector,
 					source.resource === "transcript" ? { highWatermark: lastId(snapshot) } : {},
+					maxItems,
 				);
 			}
 			if (page)
@@ -317,6 +332,7 @@ export class QueryHandlers {
 					0,
 					selector,
 					source.resource === "transcript" ? { highWatermark: lastId(snapshot) } : {},
+					maxItems,
 				);
 		}
 		const rootBytes = await this.revisions.revisionByteLength(source.resource, resourceId, revision);
@@ -490,6 +506,7 @@ export class QueryHandlers {
 		offset: number,
 		selector: CursorSelector,
 		extra: Partial<CursorEnvelope>,
+		maxItems?: number,
 	): Promise<QueryResponse> {
 		const page: QueryPage = { items, complete, revision };
 		if (!complete) {
@@ -501,7 +518,7 @@ export class QueryHandlers {
 				revision,
 				position: { offset: offset + items.length, selector },
 				direction: "forward",
-				pageShape: { targetBytes: TARGET_PAGE_BYTES },
+				pageShape: { targetBytes: TARGET_PAGE_BYTES, ...(maxItems !== undefined ? { maxItems } : {}) },
 				...extra,
 			};
 			page.continuationCursor = await this.cursors.grant(request.connectionId, envelope, resource, resourceId);
@@ -646,6 +663,13 @@ export class QueryHandlers {
 			error: { code, message, ...(restartQuery ? { restartQuery: true } : {}), ...(details ? { details } : {}) },
 		};
 	}
+}
+function pageItemLimit(input: Record<string, unknown> | undefined): number | undefined {
+	const limit = input?.limit;
+	if (limit === undefined) return undefined;
+	if (typeof limit !== "number" || !Number.isSafeInteger(limit) || limit < 1 || limit > 100)
+		throw Object.assign(new Error("limit must be an integer between 1 and 100."), { code: "invalid_input" });
+	return limit;
 }
 function selectorFor(queryId: string, input: Record<string, unknown> | undefined): CursorSelector {
 	const selector: CursorSelector = { queryId };

@@ -82,6 +82,7 @@ afterEach(async () => {
 	delete process.env.GJC_LIFECYCLE_TEST_TOKEN;
 	delete process.env.GJC_LIFECYCLE_TEST_SECRET;
 	delete process.env.GJC_LIFECYCLE_TEST_API_KEY;
+	delete process.env.GJC_TMUX_OWNER_GENERATION;
 });
 
 async function waitFor(predicate: () => boolean, label: string): Promise<void> {
@@ -1160,7 +1161,7 @@ test("concurrent /notify on waits for startup before activating notification ans
 		await allowStart.promise;
 		return await startServer.call(this);
 	};
-	const handlers = start(sessionContext, undefined, () => {}, false, commands);
+	const handlers = start(sessionContext, undefined, () => {}, false, commands, undefined, false);
 	process.env.GJC_NOTIFICATIONS = "1";
 	try {
 		const notify = commands.get("notify");
@@ -1208,7 +1209,7 @@ test("/notify on refuses a startup result for a rotated runtime identity", async
 		await allowStart.promise;
 		return await startServer.call(this);
 	};
-	const handlers = start(sessionContext, undefined, () => {}, false, commands);
+	const handlers = start(sessionContext, undefined, () => {}, false, commands, undefined, false);
 	process.env.GJC_NOTIFICATIONS = "1";
 	try {
 		const enabling = commands.get("notify")!.handler("on", sessionContext);
@@ -1250,7 +1251,7 @@ test("/notify on fences teardown and permits a later same-ID replacement runtime
 		await allowStart.promise;
 		return await startServer.call(this);
 	};
-	const handlers = start(sessionContext, undefined, () => {}, false, commands);
+	const handlers = start(sessionContext, undefined, () => {}, false, commands, undefined, false);
 	process.env.GJC_NOTIFICATIONS = "1";
 	try {
 		const enabling = commands.get("notify")!.handler("on", sessionContext);
@@ -2749,6 +2750,19 @@ test("SDK host routes pure ACP permission prompts through a live reverse provide
 	});
 	await waitFor(() => frames.some(frame => frame.type === "hello"), "SDK hello");
 	const connectionId = String(frames.find(frame => frame.type === "hello")?.connectionId);
+	socket.send(JSON.stringify({ type: "query_request", id: "authority", query: "runtime.authority", input: {} }));
+	await waitFor(
+		() => frames.some(frame => frame.type === "query_response" && frame.id === "authority"),
+		"runtime authority",
+	);
+	const authorityId = String(
+		(
+			frames.find(frame => frame.type === "query_response" && frame.id === "authority")?.result as Record<
+				string,
+				unknown
+			>
+		).authorityId,
+	);
 	socket.send(
 		JSON.stringify({
 			type: "register_provider",
@@ -2756,6 +2770,7 @@ test("SDK host routes pure ACP permission prompts through a live reverse provide
 			connectionId,
 			capability: "permission",
 			definitions: [],
+			expectedAuthorityId: authorityId,
 		}),
 	);
 	await waitFor(() => permissionProvider !== undefined, "permission provider installation");
@@ -2819,7 +2834,7 @@ test("SDK host routes pure ACP permission prompts through a live reverse provide
 	await waitFor(() => permissionProvider === undefined, "permission provider removal after disconnect");
 });
 
-test("SDK host routes AskUserQuestion through a live ACP form elicitation provider", async () => {
+test("SDK host routes AskUserQuestion through a live elicitation provider", async () => {
 	const cwd = fs.mkdtempSync(path.join(os.tmpdir(), "gjc-sdk-ui-provider-"));
 	dirs.push(cwd);
 	const sessionId = `sdk-ui-provider-${Date.now()}`;
@@ -2841,17 +2856,31 @@ test("SDK host routes AskUserQuestion through a live ACP form elicitation provid
 	const disposePriorAnswerSource = registerAskAnswerSource(sessionId, priorAnswerSource);
 	expect(getAskAnswerSource(sessionId)).toBe(priorAnswerSource);
 	const connectionId = String(frames.find(frame => frame.type === "hello")?.connectionId);
+	socket.send(JSON.stringify({ type: "query_request", id: "authority", query: "runtime.authority", input: {} }));
+	await waitFor(
+		() => frames.some(frame => frame.type === "query_response" && frame.id === "authority"),
+		"runtime authority",
+	);
+	const authorityId = String(
+		(
+			frames.find(frame => frame.type === "query_response" && frame.id === "authority")?.result as Record<
+				string,
+				unknown
+			>
+		).authorityId,
+	);
 	socket.send(
 		JSON.stringify({
 			type: "register_provider",
-			id: "ui",
+			id: "elicitation",
 			connectionId,
-			capability: "ui",
+			capability: "elicitation",
 			definitions: [],
+			expectedAuthorityId: authorityId,
 		}),
 	);
 	await waitFor(
-		() => frames.some(frame => frame.type === "register_provider_result" && frame.id === "ui"),
+		() => frames.some(frame => frame.type === "register_provider_result" && frame.id === "elicitation"),
 		"UI provider registration",
 	);
 	const requested = getAskAnswerSource(sessionId)!.awaitAnswerRequest!(
@@ -3020,8 +3049,23 @@ test("rejects malformed provider definitions without replacing a valid tools reg
 	await waitFor(() => frames.some(frame => frame.type === "hello"), "SDK hello");
 	const hello = frames.find(frame => frame.type === "hello")!;
 	const connectionId = String(hello.connectionId);
+	socket.send(JSON.stringify({ type: "query_request", id: "authority", query: "runtime.authority", input: {} }));
+	await waitFor(
+		() => frames.some(frame => frame.type === "query_response" && frame.id === "authority"),
+		"runtime authority",
+	);
+	const authorityId = String(
+		(
+			frames.find(frame => frame.type === "query_response" && frame.id === "authority")?.result as Record<
+				string,
+				unknown
+			>
+		).authorityId,
+	);
 	const sendProvider = (id: string, capability: string, definitions: unknown) =>
-		socket.send(JSON.stringify({ type: "register_provider", id, connectionId, capability, definitions }));
+		socket.send(
+			JSON.stringify({ type: "register_provider", id, connectionId, capability, definitions, expectedAuthorityId: authorityId }),
+		);
 
 	const validTool = { name: "host_read", description: "Read a host file.", parameters: {} };
 	sendProvider("valid-tool", "host_tools", [validTool]);
@@ -3070,6 +3114,317 @@ test("rejects malformed provider definitions without replacing a valid tools reg
 	expect(tools).toMatchObject({ ok: true, page: { items: [validTool] } });
 });
 
+test("disposable SDK owner proves authority-bound provider installation and terminal response receipts", async () => {
+	const cwd = fs.mkdtempSync(path.join(os.tmpdir(), "gjc-sdk-disposable-provider-proof-"));
+	dirs.push(cwd);
+	const sessionId = `sdk-disposable-provider-proof-${Date.now()}`;
+	let clientBridge:
+		| {
+				readHostUri?: (params: { uri: string; signal?: AbortSignal }) => Promise<unknown>;
+				writeHostUri?: (params: { uri: string; content: string; signal?: AbortSignal }) => Promise<void>;
+		  }
+		| undefined;
+	const ui: Record<string, (...args: never[]) => unknown> = {};
+	const ctx = {
+		...context(cwd, sessionId),
+		ui,
+		setSdkClientBridge: (bridge: typeof clientBridge) => {
+			clientBridge = bridge;
+		},
+	};
+	process.env.GJC_NOTIFICATIONS = "1";
+	process.env.GJC_TMUX_OWNER_GENERATION = "disposable-owner-generation";
+	start(ctx);
+	const endpointFile = path.join(cwd, ".gjc", "state", "sdk", `${sessionId}.json`);
+	await waitFor(() => fs.existsSync(endpointFile), "disposable SDK endpoint");
+	const endpoint = JSON.parse(fs.readFileSync(endpointFile, "utf8")) as { url: string; token: string };
+	const frames: Record<string, unknown>[] = [];
+	const socket = new WebSocket(`${endpoint.url}/?token=${encodeURIComponent(endpoint.token)}`);
+	sockets.push(socket);
+	socket.addEventListener("message", event => frames.push(JSON.parse(String(event.data))));
+	await new Promise<void>((resolve, reject) => {
+		socket.addEventListener("open", () => resolve(), { once: true });
+		socket.addEventListener("error", () => reject(new Error("WS error")), { once: true });
+	});
+	await waitFor(() => frames.some(frame => frame.type === "hello"), "disposable SDK hello");
+	const connectionId = String(frames.find(frame => frame.type === "hello")?.connectionId);
+	const directRequest = async (
+		id: string,
+		frame: Record<string, unknown>,
+		responseType: string,
+	): Promise<Record<string, unknown>> => {
+		socket.send(JSON.stringify({ ...frame, id }));
+		await waitFor(
+			() => frames.some(candidate => candidate.type === responseType && candidate.id === id),
+			`${id} response`,
+		);
+		return frames.find(candidate => candidate.type === responseType && candidate.id === id)!;
+	};
+	const authorityOne = await directRequest(
+		"authority-one",
+		{ type: "query_request", query: "runtime.authority", input: {} },
+		"query_response",
+	);
+	const authorityTwo = await directRequest(
+		"authority-two",
+		{ type: "query_request", query: "runtime.authority", input: {} },
+		"query_response",
+	);
+	expect(authorityOne).toMatchObject({
+		ok: true,
+		result: {
+			sessionId,
+			connectionId,
+			ownerGeneration: "disposable-owner-generation",
+		},
+	});
+	expect(authorityTwo.result).toEqual(authorityOne.result);
+	const authorityId = String((authorityOne.result as Record<string, unknown>).authorityId);
+	expect(authorityId).toMatch(/^[0-9a-f]{64}$/);
+
+	const capabilities = await directRequest(
+		"capabilities-proof",
+		{ type: "query_request", query: "runtime.capabilities", input: {} },
+		"query_response",
+	);
+	expect(capabilities).toMatchObject({
+		ok: true,
+		page: {
+			items: [
+				expect.objectContaining({
+					sdkProtocolFeatures: expect.arrayContaining([
+						"declarative_ui_provider_v1",
+						"provider_install_receipt_v1",
+						"reverse_response_result_v1",
+						"reverse_terminal_reservation_v1",
+						"session_host_uri_dispatch_v1",
+					]),
+				}),
+			],
+		},
+	});
+
+	socket.send(
+		JSON.stringify({
+			type: "register_provider",
+			id: "missing-authority",
+			connectionId,
+			capability: "ui",
+			definitions: [{ name: "ui.confirm" }],
+		}),
+	);
+	await waitFor(
+		() => frames.some(frame => frame.type === "reverse_response" && frame.id === "missing-authority"),
+		"missing authority rejection",
+	);
+	expect(frames.find(frame => frame.type === "reverse_response" && frame.id === "missing-authority")).toMatchObject({
+		ok: false,
+		error: { code: "invalid_reverse_frame" },
+	});
+
+	socket.send(
+		JSON.stringify({
+			type: "register_provider",
+			id: "wrong-authority",
+			connectionId,
+			capability: "ui",
+			definitions: [{ name: "ui.confirm" }],
+			expectedAuthorityId: "0".repeat(64),
+		}),
+	);
+	await waitFor(
+		() => frames.some(frame => frame.type === "reverse_response" && frame.id === "wrong-authority"),
+		"authority mismatch rejection",
+	);
+	expect(frames.find(frame => frame.type === "reverse_response" && frame.id === "wrong-authority")).toMatchObject({
+		ok: false,
+		error: { code: "authority_changed" },
+	});
+
+	const register = async (
+		id: string,
+		capability: string,
+		definitions: unknown,
+		expectedMethods: string[],
+	): Promise<Record<string, unknown>> => {
+		const response = await directRequest(
+			id,
+			{
+				type: "register_provider",
+				connectionId,
+				capability,
+				definitions,
+				expectedAuthorityId: authorityId,
+				idempotencyKey: id,
+			},
+			"register_provider_result",
+		);
+		expect(response).toMatchObject({
+			responseProtocol: "reverse_response_result_v1",
+			installedMethods: expectedMethods,
+		});
+		return response;
+	};
+	await register(
+		"ui-provider",
+		"ui",
+		[
+			{ name: "ui.select" },
+			{ name: "ui.confirm" },
+			{ name: "ui.input" },
+			{ name: "ui.editor" },
+			{ name: "ui.open_url" },
+		],
+		["ui.confirm", "ui.editor", "ui.input", "ui.open_url", "ui.select"],
+	);
+	await register(
+		"host-uri-provider",
+		"host_uri",
+		[{ scheme: "settings+local", writable: true }],
+		["host_uri.read", "host_uri.write"],
+	);
+	expect(clientBridge).toBeDefined();
+
+	const reverseRequest = async (
+		method: string,
+		invoke: () => unknown,
+	): Promise<{
+		request: Record<string, unknown>;
+		pending: Promise<unknown>;
+	}> => {
+		const priorCount = frames.filter(
+			frame => frame.type === "reverse_request" && (frame.payload as Record<string, unknown>)?.method === method,
+		).length;
+		const pending = Promise.resolve(invoke());
+		await waitFor(
+			() =>
+				frames.filter(
+					frame =>
+						frame.type === "reverse_request" && (frame.payload as Record<string, unknown>)?.method === method,
+				).length > priorCount,
+			`${method} reverse request`,
+		);
+		const request = frames
+			.filter(
+				frame => frame.type === "reverse_request" && (frame.payload as Record<string, unknown>)?.method === method,
+			)
+			.at(-1)!;
+		return { request, pending };
+	};
+	const respond = async (
+		transportId: string,
+		request: Record<string, unknown>,
+		result: unknown,
+	): Promise<Record<string, unknown>> =>
+		await directRequest(
+			transportId,
+			{
+				type: "reverse_response",
+				requestId: request.id,
+				connectionId,
+				leaseId: request.leaseId,
+				ok: true,
+				result,
+			},
+			"reverse_response_result",
+		);
+	const respondError = async (
+		transportId: string,
+		request: Record<string, unknown>,
+		code: string,
+		message: string,
+	): Promise<Record<string, unknown>> =>
+		await directRequest(
+			transportId,
+			{
+				type: "reverse_response",
+				requestId: request.id,
+				connectionId,
+				leaseId: request.leaseId,
+				ok: false,
+				error: { code, message },
+			},
+			"reverse_response_result",
+		);
+
+
+	const confirmation = await reverseRequest("ui.confirm", () =>
+		(ui.confirm as (title: string, message: string) => Promise<boolean>)("Confirm", "Continue?"),
+	);
+	const invalidAck = await respond("confirm-invalid", confirmation.request, { status: "answered", confirmed: "yes" });
+	expect(invalidAck).toMatchObject({
+		ok: false,
+		error: { code: "invalid_provider_result", retryable: true },
+	});
+	const acceptedAck = await respond("confirm-accepted", confirmation.request, { status: "answered", confirmed: true });
+	expect(acceptedAck).toMatchObject({ ok: true, disposition: "accepted" });
+	await expect(confirmation.pending).resolves.toBe(true);
+	const replayAck = await respond("confirm-replay", confirmation.request, { status: "answered", confirmed: true });
+	expect(replayAck).toMatchObject({ ok: true, disposition: "replayed" });
+	const conflictAck = await respond("confirm-conflict", confirmation.request, {
+		status: "answered",
+		confirmed: false,
+	});
+	expect(conflictAck).toMatchObject({
+		ok: false,
+		error: { code: "idempotency_conflict", retryable: false },
+	});
+
+	const opened = await reverseRequest("ui.open_url", () =>
+		(ui.openUrl as (url: string) => Promise<boolean>)("https://127.0.0.1/proof"),
+	);
+	expect(opened.request).toMatchObject({
+		payload: {
+			payload: { displayUrl: "https://127.0.0.1/proof" },
+		},
+	});
+	expect(await respondError("open-invalid-error", opened.request, "arbitrary", "Untrusted provider copy.")).toMatchObject({
+		ok: false,
+		error: { code: "invalid_provider_result", retryable: true },
+	});
+	expect(await respond("open-accepted", opened.request, { status: "opened" })).toMatchObject({
+		ok: true,
+		disposition: "accepted",
+	});
+	await expect(opened.pending).resolves.toBe(true);
+	const failedOpen = await reverseRequest("ui.open_url", () =>
+		(ui.openUrl as (url: string) => Promise<boolean>)("https://127.0.0.1/failure"),
+	);
+	const failedOpenOutcome = failedOpen.pending.catch(error => error);
+	expect(
+		await respondError(
+			"open-canonical-error",
+			failedOpen.request,
+			"open_failed",
+			"The URL could not be opened.",
+		),
+	).toMatchObject({ ok: true, disposition: "accepted" });
+	expect(await failedOpenOutcome).toMatchObject({ name: "open_failed", message: "The URL could not be opened." });
+
+	const hostRead = await reverseRequest("host_uri.read", () =>
+		clientBridge!.readHostUri!({ uri: "settings+local://preferences/theme" }),
+	);
+	expect(hostRead.request).toMatchObject({
+		payload: { payload: { uri: "settings+local://preferences/theme" } },
+	});
+	expect(
+		await respond("host-read-accepted", hostRead.request, {
+			content: "dark",
+			contentType: "text/plain",
+			immutable: false,
+		}),
+	).toMatchObject({ ok: true, disposition: "accepted" });
+	await expect(hostRead.pending).resolves.toMatchObject({ content: "dark", immutable: false });
+
+	const hostWrite = await reverseRequest("host_uri.write", () =>
+		clientBridge!.writeHostUri!({ uri: "settings+local://preferences/theme", content: "light" }),
+	);
+	expect(await respond("host-write-accepted", hostWrite.request, { written: true })).toMatchObject({
+		ok: true,
+		disposition: "accepted",
+	});
+	await expect(hostWrite.pending).resolves.toBeUndefined();
+});
 test("SDK host replay gaps are generation-scoped and sequence gaps remain coherent", async () => {
 	let receive!: (connectionId: string, frame: Record<string, unknown>) => void;
 	const sent: Array<Record<string, unknown>> = [];
@@ -3495,14 +3850,21 @@ test("SDK endpoint applies typed skill, plan, goal, and config controls with obs
 	let plan: { enabled: boolean; planFilePath: string } | undefined;
 	let goal: { enabled: boolean; goal: { objective: string; status: string } } | undefined;
 	const activeSkills: Array<{ name: string; args?: string }> = [];
+	let skillStreamingBehavior: "steer" | "followUp" | undefined;
 	const ctx = {
 		...context(cwd, sessionId),
+		isIdle: () => false,
 		getSkillState: () => activeSkills,
 		getGoalState: () => goal,
-		invokeSkill: async (name: string, args?: string) => {
+		invokeSkill: async (
+			name: string,
+			args?: string,
+			options?: { streamingBehavior?: "steer" | "followUp" },
+		) => {
 			if (name !== "fixture-skill")
 				throw Object.assign(new Error(`Skill ${name} was not found.`), { code: "invalid_input" });
 			activeSkills.push({ name, args });
+			skillStreamingBehavior = options?.streamingBehavior;
 			return { name, args };
 		},
 		setPlanMode: (on: boolean) => {
@@ -3570,6 +3932,7 @@ test("SDK endpoint applies typed skill, plan, goal, and config controls with obs
 			input: { name: "fixture-skill", args: "run" },
 		}),
 	).toMatchObject({ ok: true });
+	expect(skillStreamingBehavior).toBe("followUp");
 	expect(await request("q11", { type: "query_request", id: "q11", query: "Q11" })).toMatchObject({
 		ok: true,
 		page: { items: [{ name: "fixture-skill", args: "run" }] },

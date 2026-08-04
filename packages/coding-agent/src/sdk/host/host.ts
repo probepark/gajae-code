@@ -1,5 +1,9 @@
 import { type EventFrame, SessionEventStream } from "./events";
-import { type ProviderLease, ReverseLeaseError, ReverseLeaseRuntime } from "./reverse-leases";
+import {
+	type ProviderLease,
+	ReverseLeaseError,
+	ReverseLeaseRuntime,
+} from "./reverse-leases";
 import type { BrokerIndexWriter, HostEndpointAdapters, SdkFrame } from "./types";
 
 export type SdkRequestObserver = (kind: "control" | "query", connectionId: string, frame: SdkFrame) => void;
@@ -18,11 +22,13 @@ export interface SessionSdkHostOptions extends HostEndpointAdapters {
 	) => void | Promise<void>;
 	/** Runs only after a successful control response has been sent to the client. */
 	afterControlResponse?: (connectionId: string, request: SdkFrame, response: SdkFrame) => void | Promise<void>;
-	installProviderDefinitions?: (capability: string, definitions: unknown) => void;
+	installProviderDefinitions?: (capability: string, definitions: unknown) => unknown;
 	onProviderDefinitionsRemoved?: (capability: string) => void;
 	onReverseCancel?: (requestId: string, reason: "provider_disconnected" | "lease_released") => void;
 	/** Best-effort capabilities mirrored from the native transport for out-of-band consumers. */
 	connectionCapabilities?: (connectionId: string) => ReadonlySet<string> | undefined;
+	/** Recomputes the authenticated authority ID for a live transport connection. */
+	authorityId?: (connectionId: string) => string | undefined;
 }
 
 const TOOL_ACTIVITY_CAPABILITY = "tool_activity_v2";
@@ -59,6 +65,46 @@ function errorFrame(connectionId: string, frame: SdkFrame, error: unknown): SdkF
 		ok: false,
 		error: { code, message },
 	};
+}
+const RETRYABLE_REVERSE_RESPONSE_ERRORS = new Set([
+	"invalid_provider_result",
+	"invalid_reverse_frame",
+	"payload_too_large",
+]);
+
+function reverseResponseResult(
+	frame: SdkFrame,
+	result:
+		| { ok: true; disposition: "accepted" | "replayed" }
+		| { ok: false; error: { code: string; message: string; retryable: boolean } },
+): SdkFrame {
+	const requestId =
+		typeof frame.requestId === "string"
+			? frame.requestId
+			: typeof frame.id === "string"
+				? frame.id
+				: "";
+	return {
+		type: "reverse_response_result",
+		id: typeof frame.id === "string" ? frame.id : "",
+		requestId,
+		...result,
+	};
+}
+
+function reverseResponseErrorResult(frame: SdkFrame, error: unknown): SdkFrame {
+	const candidate = error as { code?: unknown; message?: unknown };
+	const code =
+		error instanceof ReverseLeaseError
+			? error.code
+			: typeof candidate?.code === "string"
+				? candidate.code
+				: "internal";
+	const message = typeof candidate?.message === "string" ? candidate.message : "SDK host operation failed.";
+	return reverseResponseResult(frame, {
+		ok: false,
+		error: { code, message, retryable: RETRYABLE_REVERSE_RESPONSE_ERRORS.has(code) },
+	});
 }
 
 function leaseState(id: unknown, lease: ProviderLease, active = lease.active): SdkFrame {
@@ -280,6 +326,9 @@ export class SessionSdkHost {
 					requireConnection(connectionId, frame);
 					const capability = requiredString(frame, "capability");
 					if (!has(frame, "definitions")) throw invalidFrame("definitions is required.");
+					const expectedAuthorityId = requiredString(frame, "expectedAuthorityId");
+					if (this.#options.authorityId?.(connectionId) !== expectedAuthorityId)
+						throw Object.assign(new Error("SDK endpoint authority changed."), { code: "authority_changed" });
 					const lease = this.reverse.registerProvider(
 						connectionId,
 						capability,
@@ -293,6 +342,8 @@ export class SessionSdkHost {
 						leaseId: lease.leaseId,
 						leaseExpiresAt: new Date(lease.expiresAt).toISOString(),
 						registeredNames: registeredNames(frame.definitions),
+						responseProtocol: "reverse_response_result_v1",
+						installedMethods: lease.installedMethods,
 					});
 					break;
 				}
@@ -310,15 +361,18 @@ export class SessionSdkHost {
 					break;
 				}
 				case "reverse_response": {
-					const id = requiredString(frame, "id");
+					const transportId = requiredString(frame, "id");
 					requireConnection(connectionId, frame);
 					const leaseId = requiredString(frame, "leaseId");
+					const requestId = optionalString(frame, "requestId") ?? transportId;
+					const corrected = typeof frame.requestId === "string";
 					if (typeof frame.ok !== "boolean") throw invalidFrame("ok must be a boolean.");
 					const responseError = record(frame.error);
+					let disposition: "accepted" | "replayed";
 					if (frame.ok) {
 						if (!has(frame, "result") || has(frame, "error"))
 							throw invalidFrame("Successful reverse responses require result and no error.");
-						this.reverse.respond(connectionId, id, leaseId, frame.result);
+						disposition = this.reverse.respond(connectionId, requestId, leaseId, frame.result);
 					} else {
 						if (
 							has(frame, "result") ||
@@ -327,11 +381,16 @@ export class SessionSdkHost {
 							typeof responseError.message !== "string"
 						)
 							throw invalidFrame("Failed reverse responses require a structured error and no result.");
-						this.reverse.respond(connectionId, id, leaseId, undefined, {
+						disposition = this.reverse.respond(connectionId, requestId, leaseId, undefined, {
 							code: responseError.code,
 							message: responseError.message,
 						});
 					}
+					if (corrected)
+						await this.#send(
+							connectionId,
+							reverseResponseResult(frame, { ok: true, disposition }),
+						);
 					break;
 				}
 				default:
@@ -343,7 +402,11 @@ export class SessionSdkHost {
 		} catch (error) {
 			// Structured error delivery is best-effort: if the client already
 			// disconnected, do not escalate a second send failure process-wide.
-			await this.#sendBestEffort(connectionId, errorFrame(connectionId, frame, error));
+			const response =
+				frame.type === "reverse_response" && has(frame, "requestId")
+					? reverseResponseErrorResult(frame, error)
+					: errorFrame(connectionId, frame, error);
+			await this.#sendBestEffort(connectionId, response);
 		}
 	}
 	#observeRequest(kind: "control" | "query", connectionId: string, frame: SdkFrame): void {

@@ -195,6 +195,8 @@ export interface ExtensionUIContext {
 
 	/** Show a text input dialog. */
 	input(title: string, placeholder?: string, dialogOptions?: ExtensionUIDialogOptions): Promise<string | undefined>;
+	/** Open an HTTP(S) URL through the active session UI origin when available. */
+	openUrl?(url: string, options?: { signal?: AbortSignal }): Promise<boolean>;
 
 	/** Show a notification to the user. */
 	notify(message: string, type?: "info" | "warning" | "error"): void;
@@ -412,6 +414,7 @@ export interface ExtensionContext {
 			onPreflightAccepted?: () => void;
 			onPreflightAcceptCommit?: () => void | Promise<void>;
 			onSkillPrepared?: (meta: { name: string; path: string; lineCount?: number; cleanedArgs?: string }) => void;
+			streamingBehavior?: "steer" | "followUp";
 		},
 	): Promise<unknown>;
 	setPlanMode?(on: boolean): unknown;
@@ -1511,6 +1514,7 @@ export interface ExtensionContextActions {
 			onPreflightAccepted?: () => void;
 			onPreflightAcceptCommit?: () => void | Promise<void>;
 			onSkillPrepared?: (meta: { name: string; path: string; lineCount?: number; cleanedArgs?: string }) => void;
+			streamingBehavior?: "steer" | "followUp";
 		},
 	) => Promise<unknown>;
 	setPlanMode?: (on: boolean) => unknown;

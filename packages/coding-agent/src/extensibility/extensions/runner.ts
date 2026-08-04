@@ -591,6 +591,7 @@ export class ExtensionRunner {
 
 	createContext(): ExtensionContext {
 		const getModel = this.#getModel;
+		const runner = this;
 		return {
 			ui: this.#uiContext,
 			getContextUsage: () => this.#getContextUsageFn(),
@@ -656,7 +657,9 @@ export class ExtensionRunner {
 			shutdown: () => this.#shutdownHandler(),
 			getSystemPrompt: () => [...this.#getSystemPromptFn()],
 			hasQueuedMessages: () => this.#hasPendingMessagesFn(), // deprecated alias
-			workflowGate: this.#getWorkflowGateFn(),
+			get workflowGate() {
+				return runner.#getWorkflowGateFn();
+			},
 			clearContext: () => this.#clearContextFn(),
 		};
 	}

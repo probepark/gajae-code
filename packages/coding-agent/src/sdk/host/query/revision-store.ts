@@ -390,6 +390,7 @@ export class RevisionStore {
 		id: string,
 		offset: number,
 		targetBytes: number,
+		maxItems?: number,
 	): Promise<{ items: unknown[]; complete: boolean } | undefined> {
 		const revision = this.#resources.get(`${resourceKind}:${resourceId}`)?.find(item => item.id === id);
 		if (!revision) return undefined;
@@ -398,6 +399,7 @@ export class RevisionStore {
 		const items: unknown[] = [];
 		let itemsBytes = 2; // []
 		for (const range of revision.index.items.slice(offset)) {
+			if (maxItems !== undefined && items.length >= maxItems) break;
 			// The manifest records the canonical item length, so reject an oversized
 			// item before reading or parsing its complete range.
 			if (range.end - range.start > targetBytes) break;

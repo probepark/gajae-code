@@ -36,6 +36,8 @@ import { isAuthenticated, kNoAuth } from "../../config/model-registry";
 import { Settings } from "../../config/settings";
 import type { ExtensionAPI, ExtensionCommandContext, ExtensionContext } from "../../extensibility/extensions";
 import { INTERACTIVE_SELECTOR_RESUME_ORIGIN } from "../../extensibility/shared-events";
+import { captureRepositoryBinding } from "../../gjc-runtime/repository-binding";
+import { GJC_TMUX_OWNER_GENERATION_ENV } from "../../gjc-runtime/session-state-sidecar";
 import { toAgentWireEventPayload } from "../../modes/shared/agent-wire/event-envelope";
 import {
 	NotificationGatePolicyChangedError,
@@ -59,9 +61,10 @@ import type {
 } from "../../tools";
 import { registerAskAnswerSource, registerWorkflowGateEmitterListener } from "../../tools/ask-answer-registry";
 import { acpFinalTextFromMessage } from "../acp/final-text";
+import { processIncarnation } from "../broker/process-incarnation";
 import { ensureBroker } from "../broker/ensure";
 import { SessionIndex } from "../broker/session-index";
-import { SessionSdkHost, shouldHostSdk } from "../host";
+import { type ReverseResultValidator, SessionSdkHost, shouldHostSdk } from "../host";
 import { type ControlSurface, dispatchControl } from "../host/control";
 import { CursorRegistry, QueryHandlers, RevisionStore, type SessionSurface } from "../host/query";
 import { projectQ10Models } from "../models.js";
@@ -1983,6 +1986,7 @@ function sdkQuerySurface(
 	skillStatusLookup: (selector: { commandId?: string; turnId?: string; clientRef?: string }) => unknown = () => ({
 		status: "unknown",
 	}),
+	getAuthority: (connectionId: string) => unknown = () => undefined,
 ): SessionSurface {
 	const metadata = () => ({
 		sessionId: id,
@@ -2097,10 +2101,20 @@ function sdkQuerySurface(
 		getLastAssistant: lastAssistantText,
 
 		getCapabilities: () => ({
-			operations: [...installedOperations(ctx, "control"), ...installedOperations(ctx, "query")],
+			operations: [
+				...new Set([...installedOperations(ctx, "control"), ...installedOperations(ctx, "query")]),
+			].sort(),
 			hostTools: getInstalledDefinitions("host_tools") !== undefined,
 			promptTerminalOutcomeVersion: 1,
+			sdkProtocolFeatures: [
+				"declarative_ui_provider_v1",
+				"provider_install_receipt_v1",
+				"reverse_response_result_v1",
+				"reverse_terminal_reservation_v1",
+				"session_host_uri_dispatch_v1",
+			],
 		}),
+		getAuthority,
 		getAuthProviders: () => [...new Set(ctx.modelRegistry.getAll().map(model => model.provider))],
 		getActiveProviders: () => {
 			try {
@@ -2626,6 +2640,7 @@ function sdkControlSurface(
 					onSkillPrepared: meta => {
 						prepared = meta;
 					},
+					...(isSessionBusy() ? { streamingBehavior: "followUp" as const } : {}),
 					onPreflightAcceptCommit: async () => {
 						const meta = prepared ?? { name: String(name), path: "" };
 						if (skillRecon)
@@ -3611,70 +3626,414 @@ export function createNotificationsExtension(
 
 		const revisions = new RevisionStore(id, Date.now, { storageDir: stateRoot });
 		let host: SessionSdkHost | undefined;
+		const endpointIncarnation = crypto.randomUUID();
+		const repositoryBinding = await captureRepositoryBinding(ctx.cwd);
+		const ownerGeneration = process.env[GJC_TMUX_OWNER_GENERATION_ENV]?.trim();
+		const processStartIncarnation = processIncarnation(process.pid);
+		const authorityFor = (connectionId: string) => {
+			const tuple = {
+				sessionId: id,
+				connectionId,
+				endpointGeneration: host?.generation ?? 0,
+				endpointIncarnation,
+				ownerGeneration: ownerGeneration ?? "",
+				processIncarnation: processStartIncarnation ?? "",
+				repositoryBinding: {
+					schema: repositoryBinding.schema,
+					worktreeRoot: repositoryBinding.worktreeRoot,
+					commonDir: repositoryBinding.commonDir,
+					head: repositoryBinding.head ?? "",
+					branch: repositoryBinding.branch ?? null,
+				},
+			};
+			return {
+				...tuple,
+				authorityId: crypto.createHash("sha256").update(JSON.stringify(tuple)).digest("hex"),
+			};
+		};
 		let disposeUiAnswerSource: (() => void) | undefined;
-		const installProviderDefinitions = (capability: string, definitions: unknown) => {
-			validateProviderDefinitions(capability, definitions);
-			if (capability === "permission") {
-				ctx.setSdkPermissionProvider?.(async (toolCall, permissionOptions, signal) => {
-					const result = await host!.reverse.request(
-						"permission",
-						"request",
-						{
-							toolCall,
-							options: permissionOptions,
-						},
-						signal,
-					);
-					if (!result || typeof result !== "object")
-						throw new Error("permission provider returned an invalid response");
-					const response = result as { outcome?: unknown; optionId?: unknown; kind?: unknown };
-					if (response.outcome === "cancelled") return { outcome: "cancelled" };
-					if (response.outcome === "selected" && typeof response.optionId === "string")
-						return {
-							outcome: "selected",
-							optionId: response.optionId,
-							...(typeof response.kind === "string"
-								? { kind: response.kind as "allow_once" | "allow_always" | "reject_once" | "reject_always" }
-								: {}),
-						};
-					throw new Error("permission provider returned an invalid response");
-				});
-				return;
-			}
-			if (capability === "ui") {
-				disposeUiAnswerSource?.();
-				disposeUiAnswerSource = registerAskAnswerSource(
-					id,
-					createSdkUiAskAnswerSource(
-						async (params, signal) => await host!.reverse.request("ui", "ui.elicit", params, signal),
-					),
-				);
-				return;
-			}
-			if (capability !== "fs") return;
-			// Only advertise the methods the client actually declared; a read-only client
-			// must keep using the local write path instead of failing against the bridge.
-			const names = new Set(
+		const originalUi = ctx.ui
+			? {
+					select: typeof ctx.ui.select === "function" ? ctx.ui.select.bind(ctx.ui) : undefined,
+					confirm: typeof ctx.ui.confirm === "function" ? ctx.ui.confirm.bind(ctx.ui) : undefined,
+					input: typeof ctx.ui.input === "function" ? ctx.ui.input.bind(ctx.ui) : undefined,
+					editor: typeof ctx.ui.editor === "function" ? ctx.ui.editor.bind(ctx.ui) : undefined,
+					openUrl: typeof ctx.ui.openUrl === "function" ? ctx.ui.openUrl.bind(ctx.ui) : undefined,
+				}
+			: undefined;
+		const definitionNames = (definitions: unknown): Set<string> =>
+			new Set(
 				(Array.isArray(definitions) ? definitions : [])
 					.map(definition =>
 						definition && typeof definition === "object" ? (definition as { name?: unknown }).name : undefined,
 					)
 					.filter((name): name is string => typeof name === "string"),
 			);
+		const providerError = (
+			wire: Parameters<ReverseResultValidator>[0],
+			expectedError?: { code: string; message: string },
+		): ReturnType<ReverseResultValidator> | undefined => {
+			if (wire.ok) return undefined;
+			if (
+				!expectedError ||
+				wire.error?.code !== expectedError.code ||
+				wire.error.message !== expectedError.message
+			)
+				throw new Error("invalid provider error");
+			const error = expectedError;
+			return { ok: false, error, canonical: JSON.stringify({ ok: false, error }) };
+		};
+		let fsBridge: ClientBridge | undefined;
+		let hostUriBridge: ClientBridge | undefined;
+		const applyClientBridge = () => {
+			if (!fsBridge && !hostUriBridge) {
+				ctx.setSdkClientBridge?.(undefined);
+				return;
+			}
+			ctx.setSdkClientBridge?.({
+				capabilities: {
+					...(fsBridge?.capabilities ?? {}),
+					...(hostUriBridge?.capabilities ?? {}),
+				},
+				deferAgentInitiatedTurns: true,
+				...(fsBridge?.readTextFile ? { readTextFile: fsBridge.readTextFile } : {}),
+				...(fsBridge?.writeTextFile ? { writeTextFile: fsBridge.writeTextFile } : {}),
+				...(hostUriBridge?.readHostUri ? { readHostUri: hostUriBridge.readHostUri } : {}),
+				...(hostUriBridge?.writeHostUri ? { writeHostUri: hostUriBridge.writeHostUri } : {}),
+			});
+		};
+		const installProviderDefinitions = (capability: string, definitions: unknown) => {
+			validateProviderDefinitions(capability, definitions);
+			const names = definitionNames(definitions);
+			if (capability === "permission") {
+				ctx.setSdkPermissionProvider?.(async (toolCall, permissionOptions, signal) => {
+					const validate: ReverseResultValidator = wire => {
+						const failure = providerError(wire);
+						if (failure) return failure;
+						const value = wire.result;
+						if (!value || typeof value !== "object") throw new Error("invalid permission response");
+						const response = value as { outcome?: unknown; optionId?: unknown; kind?: unknown };
+						if (response.outcome === "cancelled") {
+							const result = { outcome: "cancelled" as const };
+							return { ok: true, result, canonical: JSON.stringify(result) };
+						}
+						const option = permissionOptions.find(candidate => candidate.optionId === response.optionId);
+						if (response.outcome !== "selected" || !option) throw new Error("invalid permission response");
+						if (response.kind !== undefined && response.kind !== option.kind)
+							throw new Error("invalid permission option kind");
+						const result = { outcome: "selected" as const, optionId: option.optionId, kind: option.kind };
+						return { ok: true, result, canonical: JSON.stringify(result) };
+					};
+					return (await host!.reverse.request(
+						"permission",
+						"permission.request",
+						{ toolCall, options: permissionOptions },
+						signal,
+						validate,
+					)) as Awaited<ReturnType<NonNullable<Parameters<NonNullable<typeof ctx.setSdkPermissionProvider>>[0]>>>;
+				});
+				return { installedMethods: ["permission.request"] };
+			}
+			if (capability === "elicitation") {
+				disposeUiAnswerSource?.();
+				const validate: ReverseResultValidator = wire => {
+					const failure = providerError(wire);
+					if (failure) return failure;
+					if (!wire.result || typeof wire.result !== "object") throw new Error("invalid elicitation response");
+					return { ok: true, result: wire.result, canonical: JSON.stringify(wire.result) };
+				};
+				disposeUiAnswerSource = registerAskAnswerSource(
+					id,
+					createSdkUiAskAnswerSource(
+						async (params, signal) =>
+							await host!.reverse.request("elicitation", "ui.elicit", params, signal, validate),
+					),
+				);
+				return { installedMethods: ["ui.elicit"] };
+			}
+			if (capability === "ui") {
+				if (!ctx.ui) return { installedMethods: [] };
+				const installedMethods: string[] = [];
+				if (names.has("ui.select")) {
+					ctx.ui.select = async (title, options, dialogOptions) => {
+						const validate: ReverseResultValidator = wire => {
+							const failure = providerError(wire);
+							if (failure) return failure;
+							const value = wire.result as Record<string, unknown> | undefined;
+							if (!value || typeof value.status !== "string") throw new Error("invalid select response");
+							let result: Record<string, unknown>;
+							switch (value.status) {
+								case "selected": {
+									if (
+										!Number.isSafeInteger(value.index) ||
+										typeof value.value !== "string" ||
+										options[value.index as number] !== value.value
+									)
+										throw new Error("invalid selected response");
+									result = { status: "selected", index: value.index, value: value.value };
+									break;
+								}
+								case "custom_input":
+									if (
+										(value.kind !== "answer" && value.kind !== "clarification") ||
+										typeof value.text !== "string"
+									)
+										throw new Error("invalid custom input response");
+									result = { status: "custom_input", kind: value.kind, text: value.text };
+									break;
+								case "side_action":
+									if (value.direction !== "left" && value.direction !== "right")
+										throw new Error("invalid side action response");
+									result = { status: "side_action", direction: value.direction };
+									break;
+								case "cancelled":
+									if (value.reason !== "user" && value.reason !== "timeout")
+										throw new Error("invalid cancel response");
+									result = { status: "cancelled", reason: value.reason };
+									break;
+								default:
+									throw new Error("invalid select response");
+							}
+							return { ok: true, result, canonical: JSON.stringify(result) };
+						};
+						const result = (await host!.reverse.request(
+							"ui",
+							"ui.select",
+							{
+								title,
+								options,
+								initialIndex: dialogOptions?.initialIndex,
+								helpText: dialogOptions?.helpText,
+								outline: dialogOptions?.outline,
+								wrapFocused: dialogOptions?.wrapFocused,
+								sideActions: { left: Boolean(dialogOptions?.onLeft), right: Boolean(dialogOptions?.onRight) },
+								answerInput: dialogOptions?.customInput
+									? { optionLabel: dialogOptions.customInput.optionLabel, allowEmpty: true }
+									: undefined,
+								clarificationInput: dialogOptions?.clarificationInput
+									? {
+											optionLabel: dialogOptions.clarificationInput.optionLabel,
+											allowEmpty: dialogOptions.clarificationInput.allowEmpty ?? false,
+										}
+									: undefined,
+								timeoutMs: dialogOptions?.timeout,
+							},
+							dialogOptions?.signal,
+							validate,
+						)) as Record<string, unknown>;
+						if (result.status === "selected") return result.value as string;
+						if (result.status === "custom_input") {
+							const text = result.text as string;
+							if (result.kind === "answer") {
+								dialogOptions?.customInput?.onSubmit(text);
+								return dialogOptions?.customInput?.optionLabel;
+							}
+							dialogOptions?.clarificationInput?.onSubmit(text);
+							return dialogOptions?.clarificationInput?.optionLabel;
+						}
+						if (result.status === "side_action") {
+							if (result.direction === "left") dialogOptions?.onLeft?.();
+							else dialogOptions?.onRight?.();
+						}
+						if (result.status === "cancelled" && result.reason === "timeout") dialogOptions?.onTimeout?.();
+						return undefined;
+					};
+					installedMethods.push("ui.select");
+				}
+				if (names.has("ui.confirm")) {
+					ctx.ui.confirm = async (title, message, dialogOptions) => {
+						const validate: ReverseResultValidator = wire => {
+							const failure = providerError(wire);
+							if (failure) return failure;
+							const value = wire.result as Record<string, unknown> | undefined;
+							if (!value || (value.status !== "answered" && value.status !== "cancelled"))
+								throw new Error("invalid confirm response");
+							const result =
+								value.status === "answered" && typeof value.confirmed === "boolean"
+									? { status: "answered", confirmed: value.confirmed }
+									: value.status === "cancelled" && (value.reason === "user" || value.reason === "timeout")
+										? { status: "cancelled", reason: value.reason }
+										: undefined;
+							if (!result) throw new Error("invalid confirm response");
+							return { ok: true, result, canonical: JSON.stringify(result) };
+						};
+						const result = (await host!.reverse.request(
+							"ui",
+							"ui.confirm",
+							{ title, message, timeoutMs: dialogOptions?.timeout },
+							dialogOptions?.signal,
+							validate,
+						)) as Record<string, unknown>;
+						if (result.status === "cancelled" && result.reason === "timeout") dialogOptions?.onTimeout?.();
+						return result.status === "answered" && result.confirmed === true;
+					};
+					installedMethods.push("ui.confirm");
+				}
+				const installTextMethod = (method: "ui.input" | "ui.editor") => {
+					const validate: ReverseResultValidator = wire => {
+						const failure = providerError(wire);
+						if (failure) return failure;
+						const value = wire.result as Record<string, unknown> | undefined;
+						const result =
+							value?.status === "submitted" && typeof value.value === "string"
+								? { status: "submitted", value: value.value }
+								: value?.status === "cancelled" && (value.reason === "user" || value.reason === "timeout")
+									? { status: "cancelled", reason: value.reason }
+									: undefined;
+						if (!result) throw new Error("invalid text response");
+						return { ok: true, result, canonical: JSON.stringify(result) };
+					};
+					if (method === "ui.input")
+						ctx.ui.input = async (title, placeholder, dialogOptions) => {
+							const result = (await host!.reverse.request(
+								"ui",
+								method,
+								{ title, placeholder, timeoutMs: dialogOptions?.timeout },
+								dialogOptions?.signal,
+								validate,
+							)) as Record<string, unknown>;
+							if (result.status === "cancelled" && result.reason === "timeout") dialogOptions?.onTimeout?.();
+							return result.status === "submitted" ? (result.value as string) : undefined;
+						};
+					else
+						ctx.ui.editor = async (title, prefill, dialogOptions, editorOptions) => {
+							const result = (await host!.reverse.request(
+								"ui",
+								method,
+								{
+									title,
+									prefill,
+									promptStyle: editorOptions?.promptStyle ?? false,
+									timeoutMs: dialogOptions?.timeout,
+								},
+								dialogOptions?.signal,
+								validate,
+							)) as Record<string, unknown>;
+							if (result.status === "cancelled" && result.reason === "timeout") dialogOptions?.onTimeout?.();
+							return result.status === "submitted" ? (result.value as string) : undefined;
+						};
+					installedMethods.push(method);
+				};
+				if (names.has("ui.input")) installTextMethod("ui.input");
+				if (names.has("ui.editor")) installTextMethod("ui.editor");
+				if (names.has("ui.open_url")) {
+					ctx.ui.openUrl = async (url, options) => {
+						const parsed = new URL(url);
+						if (parsed.protocol !== "http:" && parsed.protocol !== "https:") throw new Error("invalid URL scheme");
+						const validate: ReverseResultValidator = wire => {
+							const failure = providerError(wire, {
+								code: "open_failed",
+								message: "The URL could not be opened.",
+							});
+							if (failure) return failure;
+							const value = wire.result as Record<string, unknown> | undefined;
+							const result =
+								value?.status === "opened"
+									? { status: "opened" }
+									: value?.status === "cancelled" && value.reason === "user"
+										? { status: "cancelled", reason: "user" }
+										: undefined;
+							if (!result) throw new Error("invalid open URL response");
+							return { ok: true, result, canonical: JSON.stringify(result) };
+						};
+						const result = (await host!.reverse.request(
+							"ui",
+							"ui.open_url",
+							{ url, displayUrl: `${parsed.origin}${parsed.pathname}` },
+							options?.signal,
+							validate,
+						)) as Record<string, unknown>;
+						return result.status === "opened";
+					};
+					installedMethods.push("ui.open_url");
+				}
+				return { installedMethods };
+			}
+			if (capability === "host_uri") {
+				const definitionsList = Array.isArray(definitions)
+					? definitions.filter(
+							(definition): definition is { scheme: string; writable?: boolean } =>
+								Boolean(
+									definition &&
+										typeof definition === "object" &&
+										typeof (definition as { scheme?: unknown }).scheme === "string",
+								),
+						)
+					: [];
+				const canWrite = definitionsList.some(definition => definition.writable === true);
+				const readValidator: ReverseResultValidator = wire => {
+					const failure = providerError(wire, {
+						code: "provider_error",
+						message: "Host URI provider failed.",
+					});
+					if (failure) return failure;
+					const value = wire.result as Record<string, unknown> | undefined;
+					if (
+						!value ||
+						typeof value.content !== "string" ||
+						(value.contentType !== "text/markdown" &&
+							value.contentType !== "application/json" &&
+							value.contentType !== "text/plain") ||
+						typeof value.immutable !== "boolean" ||
+						(value.notes !== undefined &&
+							(!Array.isArray(value.notes) || value.notes.some(note => typeof note !== "string")))
+					)
+						throw new Error("invalid host URI read response");
+					const result = {
+						content: value.content,
+						contentType: value.contentType,
+						...(value.notes ? { notes: value.notes } : {}),
+						immutable: value.immutable,
+					};
+					return { ok: true, result, canonical: JSON.stringify(result) };
+				};
+				const writeValidator: ReverseResultValidator = wire => {
+					const failure = providerError(wire, {
+						code: "provider_error",
+						message: "Host URI provider failed.",
+					});
+					if (failure) return failure;
+					const value = wire.result as Record<string, unknown> | undefined;
+					if (value?.written !== true) throw new Error("invalid host URI write response");
+					const result = { written: true };
+					return { ok: true, result, canonical: JSON.stringify(result) };
+				};
+				hostUriBridge = {
+					capabilities: { readHostUri: true, writeHostUri: canWrite },
+					deferAgentInitiatedTurns: true,
+					async readHostUri(params) {
+						return (await host!.reverse.request(
+							"host_uri",
+							"host_uri.read",
+							{ uri: params.uri },
+							params.signal,
+							readValidator,
+						)) as Awaited<ReturnType<NonNullable<ClientBridge["readHostUri"]>>>;
+					},
+					async writeHostUri(params) {
+						await host!.reverse.request(
+							"host_uri",
+							"host_uri.write",
+							{ uri: params.uri, content: params.content },
+							params.signal,
+							writeValidator,
+						);
+					},
+				};
+				if (!canWrite) delete hostUriBridge.writeHostUri;
+				applyClientBridge();
+				return {
+					installedMethods: ["host_uri.read", ...(canWrite ? ["host_uri.write"] : [])],
+				};
+			}
+			if (capability !== "fs") return { installedMethods: [] };
 			const canRead = names.size === 0 || names.has("fs.readTextFile");
 			const canWrite = names.size === 0 || names.has("fs.writeTextFile");
 			const bridge: ClientBridge = {
 				capabilities: { readTextFile: canRead, writeTextFile: canWrite },
 				deferAgentInitiatedTurns: true,
 				async readTextFile(params) {
-					const result = await host!.reverse.request("fs", "fs.readTextFile", params);
-					if (
-						!result ||
-						typeof result !== "object" ||
-						typeof (result as { content?: unknown }).content !== "string"
-					)
-						throw new Error("fs provider returned an invalid read response");
-					return (result as { content: string }).content;
+					return (await host!.reverse.request("fs", "fs.readTextFile", params)) as string;
 				},
 				async writeTextFile(params) {
 					await host!.reverse.request("fs", "fs.writeTextFile", params);
@@ -3682,14 +4041,40 @@ export function createNotificationsExtension(
 			};
 			if (!canRead) delete bridge.readTextFile;
 			if (!canWrite) delete bridge.writeTextFile;
-			ctx.setSdkClientBridge?.(bridge);
+			fsBridge = bridge;
+			applyClientBridge();
+			return {
+				installedMethods: [
+					...(canRead ? ["fs.readTextFile"] : []),
+					...(canWrite ? ["fs.writeTextFile"] : []),
+				],
+			};
 		};
 		const removeProviderDefinitions = (capability: string) => {
 			if (capability === "permission") ctx.setSdkPermissionProvider?.(undefined);
-			if (capability === "fs") ctx.setSdkClientBridge?.(undefined);
-			if (capability === "ui") {
+			if (capability === "fs") {
+				fsBridge = undefined;
+				applyClientBridge();
+			}
+			if (capability === "host_uri") {
+				hostUriBridge = undefined;
+				applyClientBridge();
+			}
+			if (capability === "elicitation") {
 				disposeUiAnswerSource?.();
 				disposeUiAnswerSource = undefined;
+			}
+			if (capability === "ui" && ctx.ui && originalUi) {
+				if (originalUi.select) ctx.ui.select = originalUi.select;
+				else Reflect.deleteProperty(ctx.ui, "select");
+				if (originalUi.confirm) ctx.ui.confirm = originalUi.confirm;
+				else Reflect.deleteProperty(ctx.ui, "confirm");
+				if (originalUi.input) ctx.ui.input = originalUi.input;
+				else Reflect.deleteProperty(ctx.ui, "input");
+				if (originalUi.editor) ctx.ui.editor = originalUi.editor;
+				else Reflect.deleteProperty(ctx.ui, "editor");
+				if (originalUi.openUrl) ctx.ui.openUrl = originalUi.openUrl;
+				else delete ctx.ui.openUrl;
 			}
 		};
 
@@ -4182,6 +4567,7 @@ export function createNotificationsExtension(
 				configOverrides,
 				lookupPromptStatus,
 				selector => kindReconciliation.lookup("skill", selector),
+				authorityFor,
 			),
 			id,
 			revisions,
@@ -4283,6 +4669,7 @@ export function createNotificationsExtension(
 			token,
 			sendFrame: (connectionId, frame) => sendSdkFrame(connectionId, frame),
 			connectionCapabilities: connectionId => hostCapCache.get(connectionId),
+			authorityId: connectionId => authorityFor(connectionId).authorityId,
 			installProviderDefinitions,
 			onProviderDefinitionsRemoved: removeProviderDefinitions,
 			onFrame: handler => {

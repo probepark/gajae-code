@@ -45,8 +45,8 @@ describe("directed reverse RPC leases", () => {
 		});
 		runtime.release("c", handedOff.leaseId, "d");
 		now += 15_000;
-		expect(() => runtime.request("terminal", "run", {})).toThrow("provider_required");
-		expect(runtime.registerProvider("d", "terminal", {}).leaseId).not.toBe(handedOff.leaseId);
+		expect(() => runtime.request("terminal", "run", {})).toThrow("lease_unavailable");
+		expect(runtime.registerProvider("d", "terminal", {}, handedOff.leaseId).leaseId).toBe(handedOff.leaseId);
 		expect(() => runtime.release("b", reclaimed.leaseId)).toThrow("not_lease_owner");
 	});
 

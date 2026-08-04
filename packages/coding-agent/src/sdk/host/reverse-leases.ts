@@ -3,9 +3,11 @@ import type { SdkFrame } from "./types";
 
 export const REVERSE_HEARTBEAT_MS = 5_000;
 export const REVERSE_LEASE_TTL_MS = 15_000;
-export const REVERSE_RECLAIM_GRACE_MS = 15_000;
+export const REVERSE_RECLAIM_GRACE_MS = 30_000;
 export const MAX_REVERSE_OUTSTANDING = 64;
 export const MAX_REVERSE_PAYLOAD_BYTES = 256 * 1024;
+export const MAX_REVERSE_TERMINAL_RECORDS = 256;
+export const REVERSE_TOMBSTONE_TTL_MS = 30_000;
 
 export class ReverseLeaseError extends Error {
 	constructor(
@@ -18,7 +20,9 @@ export class ReverseLeaseError extends Error {
 			| "payload_too_large"
 			| "too_many_outstanding"
 			| "unknown_request"
-			| "idempotency_conflict",
+			| "idempotency_conflict"
+			| "terminal_capacity_exceeded"
+			| "invalid_provider_result",
 		message = code,
 	) {
 		super(message);
@@ -30,26 +34,51 @@ export interface ProviderLease {
 	connectionId: string;
 	capability: string;
 	definitions: unknown;
+	installedMethods: string[];
 	expiresAt: number;
 	graceUntil?: number;
 	active: boolean;
 }
 
+export interface ProviderInstallationReceipt {
+	installedMethods: readonly string[];
+}
+export type ValidatedReverseSettlement =
+	| { ok: true; result: unknown; canonical: string }
+	| { ok: false; error: { code: string; message: string }; canonical: string };
+
+export type ReverseResultValidator = (wire: {
+	ok: boolean;
+	result?: unknown;
+	error?: { code: string; message: string };
+}) => ValidatedReverseSettlement;
+
 interface Outstanding {
 	connectionId: string;
 	capability: string;
+	method: string;
 	leaseId: string;
 	resolve: (value: unknown) => void;
 	reject: (reason: Error) => void;
+	validate?: ReverseResultValidator;
 	signal?: AbortSignal;
 	onAbort?: () => void;
+}
+
+interface TerminalRecord {
+	capability: string;
+	method: string;
+	leaseId: string;
+	fingerprint: string;
+	validate?: ReverseResultValidator;
+	expiresAt: number;
 }
 
 export interface ReverseLeaseOptions {
 	now?: () => number;
 	leaseTtlMs?: number;
 	sendFrame: (connectionId: string, frame: SdkFrame) => void | Promise<void>;
-	installDefinitions?: (capability: string, definitions: unknown) => void;
+	installDefinitions?: (capability: string, definitions: unknown) => unknown;
 	onCancel?: (requestId: string, reason: "provider_disconnected" | "lease_released") => void;
 	onDefinitionsRemoved?: (capability: string) => void;
 }
@@ -71,6 +100,63 @@ function registrationFingerprint(capability: string, definitions: unknown, expec
 		.digest("hex");
 }
 
+function responseFingerprint(result: unknown, error?: { code: string; message: string }): string {
+	return createHash("sha256").update(canonicalJson(error ? { ok: false, error } : { ok: true, result })).digest("hex");
+}
+
+function normalizedMethods(receipt: unknown): string[] {
+	if (
+		!receipt ||
+		typeof receipt !== "object" ||
+		!Array.isArray((receipt as Partial<ProviderInstallationReceipt>).installedMethods)
+	) {
+		return [];
+	}
+	return [
+		...new Set(
+			(receipt as ProviderInstallationReceipt).installedMethods.filter(
+				(method): method is string => typeof method === "string" && method.length > 0,
+			),
+		),
+	].sort();
+}
+function canonicalFingerprint(canonical: string): string {
+	return createHash("sha256").update(canonical).digest("hex");
+}
+
+function validateSettlement(
+	validate: ReverseResultValidator | undefined,
+	result: unknown,
+	error?: { code: string; message: string },
+): { result?: unknown; error?: { code: string; message: string }; fingerprint: string } {
+	if (!validate) return { ...(error ? { error } : { result }), fingerprint: responseFingerprint(result, error) };
+	let settlement: ValidatedReverseSettlement;
+	try {
+		settlement = validate(error ? { ok: false, error } : { ok: true, result });
+	} catch {
+		throw new ReverseLeaseError("invalid_provider_result");
+	}
+	if (
+		!settlement ||
+		typeof settlement !== "object" ||
+		typeof settlement.ok !== "boolean" ||
+		typeof settlement.canonical !== "string" ||
+		settlement.canonical.length === 0
+	)
+		throw new ReverseLeaseError("invalid_provider_result");
+	if (settlement.ok) return { result: settlement.result, fingerprint: canonicalFingerprint(settlement.canonical) };
+	if (
+		!settlement.error ||
+		typeof settlement.error.code !== "string" ||
+		typeof settlement.error.message !== "string"
+	)
+		throw new ReverseLeaseError("invalid_provider_result");
+	return { error: settlement.error, fingerprint: canonicalFingerprint(settlement.canonical) };
+}
+function cloneLease(lease: ProviderLease): ProviderLease {
+	return { ...lease, installedMethods: [...lease.installedMethods] };
+}
+
 /** Session-local directed reverse RPC lease registry. */
 export class ReverseLeaseRuntime {
 	readonly #now: () => number;
@@ -82,6 +168,7 @@ export class ReverseLeaseRuntime {
 	readonly #leases = new Map<string, ProviderLease>();
 	readonly #idempotency = new Map<string, { fingerprint: string; lease: ProviderLease }>();
 	readonly #outstanding = new Map<string, Outstanding>();
+	readonly #terminal = new Map<string, TerminalRecord>();
 	readonly #installedCapabilities = new Set<string>();
 	readonly #sweepTimer: ReturnType<typeof setInterval>;
 	#disposing = false;
@@ -111,7 +198,7 @@ export class ReverseLeaseRuntime {
 		if (replay) {
 			if (replay.fingerprint !== fingerprint) throw new ReverseLeaseError("idempotency_conflict");
 			const current = this.#leases.get(capability);
-			if (replay.lease === current && current?.active && current.expiresAt > this.#now()) return { ...replay.lease };
+			if (replay.lease === current && current?.active && current.expiresAt > this.#now()) return cloneLease(replay.lease);
 		}
 		const now = this.#now();
 		const existing = this.#leases.get(capability);
@@ -120,18 +207,19 @@ export class ReverseLeaseRuntime {
 		if (pendingHandoff) {
 			if (existing!.connectionId !== connectionId || existing!.leaseId !== expectedLeaseId)
 				throw new ReverseLeaseError("provider_lease_conflict");
-			this.#installDefinitionsFor(capability, definitions);
+			const installedMethods = this.#installDefinitionsFor(capability, definitions);
 			const lease: ProviderLease = {
 				leaseId: existing!.leaseId,
 				connectionId,
 				capability,
 				definitions,
+				installedMethods,
 				expiresAt: now + this.#leaseTtlMs,
 				active: true,
 			};
 			this.#leases.set(capability, lease);
 			if (idempotencyKey) this.#idempotency.set(key, { fingerprint, lease });
-			return { ...lease };
+			return cloneLease(lease);
 		}
 		const reclaiming =
 			existing?.leaseId === expectedLeaseId && existing?.graceUntil !== undefined && now <= existing.graceUntil;
@@ -139,18 +227,19 @@ export class ReverseLeaseRuntime {
 			existing?.active !== false && existing?.connectionId === connectionId && existing.expiresAt > now;
 		if (existing && !reclaiming && !refreshing && existing.connectionId !== connectionId && existing.expiresAt > now)
 			throw new ReverseLeaseError("provider_lease_conflict");
-		this.#installDefinitionsFor(capability, definitions);
+		const installedMethods = this.#installDefinitionsFor(capability, definitions);
 		const lease: ProviderLease = {
 			leaseId: reclaiming || refreshing ? existing!.leaseId : randomUUID(),
 			connectionId,
 			capability,
 			definitions,
+			installedMethods,
 			expiresAt: now + this.#leaseTtlMs,
 			active: true,
 		};
 		this.#leases.set(capability, lease);
 		if (idempotencyKey) this.#idempotency.set(key, { fingerprint, lease });
-		return { ...lease };
+		return cloneLease(lease);
 	}
 
 	heartbeat(connectionId: string, leaseId: string): ProviderLease {
@@ -161,7 +250,7 @@ export class ReverseLeaseRuntime {
 		}
 		lease.expiresAt = this.#now() + this.#leaseTtlMs;
 		lease.graceUntil = undefined;
-		return { ...lease };
+		return cloneLease(lease);
 	}
 
 	release(connectionId: string, leaseId: string, handoffTo?: string): ProviderLease {
@@ -173,10 +262,10 @@ export class ReverseLeaseRuntime {
 			lease.expiresAt = this.#now() + REVERSE_RECLAIM_GRACE_MS;
 			lease.graceUntil = undefined;
 			lease.active = false;
-			return { ...lease };
+			return cloneLease(lease);
 		}
 		this.#leases.delete(lease.capability);
-		return { ...lease };
+		return cloneLease(lease);
 	}
 
 	disconnect(connectionId: string): void {
@@ -190,7 +279,13 @@ export class ReverseLeaseRuntime {
 		this.#cancelForConnection(connectionId, "provider_disconnected");
 	}
 
-	request(capability: string, method: string, payload: unknown, signal?: AbortSignal): Promise<unknown> {
+	request(
+		capability: string,
+		method: string,
+		payload: unknown,
+		signal?: AbortSignal,
+		validate?: ReverseResultValidator,
+	): Promise<unknown> {
 		if (this.#disposing) throw new Error("reverse runtime is disposing");
 		this.#assertPayload(payload);
 		const lease = this.#liveLease(capability);
@@ -202,15 +297,20 @@ export class ReverseLeaseRuntime {
 		}
 		if (signal?.aborted)
 			return Promise.reject(Object.assign(new Error("request_cancelled"), { name: "request_cancelled" }));
+		this.#sweepTerminal();
 		if (this.#outstanding.size >= MAX_REVERSE_OUTSTANDING) throw new ReverseLeaseError("too_many_outstanding");
+		if (this.#outstanding.size + this.#terminal.size >= MAX_REVERSE_TERMINAL_RECORDS)
+			throw new ReverseLeaseError("terminal_capacity_exceeded");
 		const id = randomUUID();
 		return new Promise((resolve, reject) => {
 			const outstanding: Outstanding = {
 				connectionId: lease.connectionId,
 				capability,
+				method,
 				leaseId: lease.leaseId,
 				resolve,
 				reject,
+				...(validate ? { validate } : {}),
 				...(signal ? { signal } : {}),
 			};
 			this.#outstanding.set(id, outstanding);
@@ -264,28 +364,54 @@ export class ReverseLeaseRuntime {
 		leaseId: string,
 		result: unknown,
 		error?: { code: string; message: string },
-	): void {
-		this.#assertPayload(result);
+	): "accepted" | "replayed" {
+		this.#assertPayload(error ?? result);
+		this.#sweepTerminal();
+		const terminal = this.#terminal.get(id);
+		if (terminal) {
+			const lease = this.#owner(connectionId, leaseId);
+			if (lease.capability !== terminal.capability || terminal.leaseId !== leaseId)
+				throw new ReverseLeaseError("not_lease_owner");
+			const replay = validateSettlement(terminal.validate, result, error);
+			if (terminal.fingerprint !== replay.fingerprint) throw new ReverseLeaseError("idempotency_conflict");
+			return "replayed";
+		}
 		const request = this.#outstanding.get(id);
 		if (!request) throw new ReverseLeaseError("unknown_request");
 		if (request.connectionId !== connectionId || request.leaseId !== leaseId)
 			throw new ReverseLeaseError("not_lease_owner");
+
+		const accepted = validateSettlement(request.validate, result, error);
+		this.#assertPayload(accepted.error ?? accepted.result);
+		this.#terminal.set(id, {
+			capability: request.capability,
+			method: request.method,
+			leaseId: request.leaseId,
+			fingerprint: accepted.fingerprint,
+			...(request.validate ? { validate: request.validate } : {}),
+			expiresAt: this.#now() + REVERSE_TOMBSTONE_TTL_MS,
+		});
 		this.#takeOutstanding(id);
-		if (error) {
-			const rejection = new Error(error.message);
-			rejection.name = error.code;
+		if (accepted.error) {
+			const rejection = new Error(accepted.error.message);
+			rejection.name = accepted.error.code;
 			request.reject(rejection);
-		} else request.resolve(result);
+		} else request.resolve(accepted.result);
+		return "accepted";
 	}
 
 	getLease(capability: string): ProviderLease | undefined {
 		const lease = this.#liveLease(capability);
-		return lease && { ...lease };
+		return lease && cloneLease(lease);
 	}
 
 	/** Installed definitions are observable only while their provider lease is live. */
 	getInstalledDefinitions(capability: string): unknown | undefined {
 		return this.#liveLease(capability)?.definitions;
+	}
+	getInstalledMethods(capability: string): readonly string[] | undefined {
+		const lease = this.#liveLease(capability);
+		return lease ? [...lease.installedMethods] : undefined;
 	}
 
 	dispose(): void {
@@ -298,6 +424,7 @@ export class ReverseLeaseRuntime {
 		this.#installedCapabilities.clear();
 		this.#leases.clear();
 		this.#idempotency.clear();
+		this.#terminal.clear();
 		for (const request of outstanding.map(([, request]) => request))
 			if (request.signal && request.onAbort) request.signal.removeEventListener("abort", request.onAbort);
 		for (const [id, request] of outstanding) {
@@ -330,6 +457,7 @@ export class ReverseLeaseRuntime {
 	#expireStaleLeases(): void {
 		for (const lease of this.#leases.values())
 			if (lease.expiresAt <= this.#now()) this.#removeDefinitions(lease.capability);
+		this.#sweepTerminal();
 	}
 	#cancelForConnection(connectionId: string, reason: "provider_disconnected" | "lease_released"): void {
 		for (const [id, request] of this.#outstanding)
@@ -346,9 +474,15 @@ export class ReverseLeaseRuntime {
 		if (request.signal && request.onAbort) request.signal.removeEventListener("abort", request.onAbort);
 		return request;
 	}
-	#installDefinitionsFor(capability: string, definitions: unknown): void {
-		this.#installDefinitions?.(capability, definitions);
+	#sweepTerminal(): void {
+		const now = this.#now();
+		for (const [id, terminal] of this.#terminal)
+			if (terminal.expiresAt <= now) this.#terminal.delete(id);
+	}
+	#installDefinitionsFor(capability: string, definitions: unknown): string[] {
+		const installedMethods = normalizedMethods(this.#installDefinitions?.(capability, definitions));
 		this.#installedCapabilities.add(capability);
+		return installedMethods;
 	}
 	#removeDefinitions(capability: string): void {
 		if (!this.#installedCapabilities.delete(capability)) return;

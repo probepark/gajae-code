@@ -7,6 +7,7 @@ import type {
 	ExtensionUIContext,
 } from "../../../src/extensibility/extensions";
 import { ExtensionUiController } from "../../../src/modes/controllers/extension-ui-controller";
+import type { WorkflowGateEmitter } from "../../../src/modes/shared/agent-wire/workflow-gate-broker";
 import type { InteractiveModeContext, TranscriptRebuildPolicy } from "../../../src/modes/types";
 
 type Fixture = {
@@ -14,6 +15,8 @@ type Fixture = {
 	ctx: InteractiveModeContext;
 	getActions: () => ExtensionActions;
 	getCommandActions: () => ExtensionCommandContextActions;
+	getContextActions: () => ExtensionContextActions;
+	workflowGateEmitter: WorkflowGateEmitter;
 	setNextSessionId: (id: string) => void;
 	getUiContext: () => ExtensionUIContext;
 	setStopped: (stopped: boolean) => void;
@@ -26,6 +29,7 @@ type Fixture = {
 function createFixture(initialSessionId = "session-a"): Fixture {
 	let actions: ExtensionActions | undefined;
 	let commandActions: ExtensionCommandContextActions | undefined;
+	let contextActions: ExtensionContextActions | undefined;
 	let uiContext: ExtensionUIContext | undefined;
 	let stopped = false;
 	let errorListener: ((error: { extensionPath: string; error: string }) => void) | undefined;
@@ -34,15 +38,17 @@ function createFixture(initialSessionId = "session-a"): Fixture {
 	const rebuildInitialMessages = vi.fn<(policy: TranscriptRebuildPolicy) => void>();
 	const rebuildChatFromMessages = vi.fn<(policy: TranscriptRebuildPolicy) => void>();
 	const resetIrcSidebarSession = vi.fn<() => void>();
+	const workflowGateEmitter = { supportsRemoteGateAnswers: false, emitGate: vi.fn() } as unknown as WorkflowGateEmitter;
 	const extensionRunner = {
 		initialize(
 			capturedActions: ExtensionActions,
-			_contextActions: ExtensionContextActions,
+			capturedContextActions: ExtensionContextActions,
 			capturedCommandActions?: ExtensionCommandContextActions,
 			capturedUiContext?: ExtensionUIContext,
 		): void {
 			actions = capturedActions;
 			commandActions = capturedCommandActions;
+			contextActions = capturedContextActions;
 			uiContext = capturedUiContext;
 		},
 		onError: (listener: (error: { extensionPath: string; error: string }) => void) => {
@@ -68,6 +74,7 @@ function createFixture(initialSessionId = "session-a"): Fixture {
 			reload: vi.fn(async () => {
 				sessionId = nextSessionId;
 			}),
+			getWorkflowGateEmitter: () => workflowGateEmitter,
 		},
 		sessionManager: {
 			getSessionId: () => sessionId,
@@ -102,6 +109,10 @@ function createFixture(initialSessionId = "session-a"): Fixture {
 			if (!commandActions) throw new Error("Extension command actions were not initialized");
 			return commandActions;
 		},
+		getContextActions: () => {
+			if (!contextActions) throw new Error("Extension context actions were not initialized");
+			return contextActions;
+		},
 		getUiContext: () => {
 			if (!uiContext) throw new Error("Extension UI context was not initialized");
 			return uiContext;
@@ -116,6 +127,7 @@ function createFixture(initialSessionId = "session-a"): Fixture {
 		rebuildInitialMessages,
 		rebuildChatFromMessages,
 		resetIrcSidebarSession,
+		workflowGateEmitter,
 	};
 }
 
@@ -129,6 +141,20 @@ describe("ExtensionUiController transcript rebuild policy", () => {
 
 		expect(fixture.resetIrcSidebarSession).toHaveBeenCalledTimes(1);
 		expect(fixture.rebuildInitialMessages).toHaveBeenCalledWith("replace-identity");
+	});
+
+	it("exposes the live workflow-gate emitter through the foreground extension context", async () => {
+		const fixture = createFixture();
+		await fixture.controller.initHooksAndCustomTools();
+
+		expect(fixture.getContextActions().getWorkflowGate?.()).toBe(fixture.workflowGateEmitter);
+	});
+
+	it("exposes the live workflow-gate emitter through the hook-runner extension context", () => {
+		const fixture = createFixture();
+		fixture.controller.initializeHookRunner({} as ExtensionUIContext, false);
+
+		expect(fixture.getContextActions().getWorkflowGate?.()).toBe(fixture.workflowGateEmitter);
 	});
 
 	it("reconciles a true same-session switch in the foreground extension path", async () => {
