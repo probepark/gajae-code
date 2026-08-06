@@ -798,8 +798,89 @@ describe("anthropic stream envelope handling", () => {
 		).toBe(false);
 	});
 
-	it("retries once without generated caching after a cache breakpoint overflow and keeps it off", async () => {
-		// A gateway that injects its own block-level markers leaves no slot for ours.
+	it("steps generated breakpoints down one at a time after a cache breakpoint overflow", async () => {
+		// A gateway that injects its own block-level markers leaves few slots for ours.
+		const gatewayModel: Model<"anthropic-messages"> = {
+			...model,
+			baseUrl: "https://proxy.example.com/anthropic",
+		};
+		// A prior assistant turn exists, so explicit mode has both a prefix anchor
+		// and a current-turn refresh point to place.
+		const toolLoopContext: Context = {
+			messages: [
+				{ role: "user", content: "First question", timestamp: 1 },
+				{
+					role: "assistant",
+					content: [{ type: "text", text: "First answer" }],
+					api: "anthropic-messages",
+					provider: "anthropic",
+					model: model.id,
+					usage: {
+						input: 0,
+						output: 0,
+						cacheRead: 0,
+						cacheWrite: 0,
+						totalTokens: 0,
+						cost: { input: 0, output: 0, cacheRead: 0, cacheWrite: 0, total: 0 },
+					},
+					stopReason: "stop",
+					timestamp: 2,
+				},
+				{ role: "user", content: "Second question", timestamp: 3 },
+			],
+		};
+		const providerSessionState = new Map<string, ProviderSessionState>();
+		const breakpointCounts: number[] = [];
+		let attempt = 0;
+		vi.spyOn(Messages.prototype, "create").mockImplementation((params: unknown) => {
+			attempt += 1;
+			breakpointCounts.push(cacheControlCount(params));
+			// Reject while we still generate more than one breakpoint; a gateway with
+			// exactly one free slot accepts the reduced request.
+			if (cacheControlCount(params) > 1) {
+				return createRejectedMockRequest(createCacheBreakpointOverflowError()) as never;
+			}
+			return createMockRequest(createTextSuccessEvents("recovered")) as never;
+		});
+
+		const stream = streamAnthropic(gatewayModel, toolLoopContext, {
+			apiKey: "sk-ant-test",
+			providerSessionState,
+		});
+		const events: AssistantMessageEvent[] = [];
+		for await (const event of stream) {
+			events.push(event);
+		}
+		const result = await stream.result();
+
+		expect(attempt).toBe(2);
+		expect(result.stopReason).toBe("stop");
+		expect(result.content).toEqual([{ type: "text", text: "recovered" }]);
+		expect(countEvents(events, "error")).toBe(0);
+		// The rejected attempt carried two markers; the retry keeps one rather than
+		// giving up caching entirely.
+		expect(breakpointCounts[0]).toBe(2);
+		expect(breakpointCounts[1]).toBe(1);
+		expect(
+			(providerSessionState.get("anthropic-messages") as { generatedCacheBudget?: number } | undefined)
+				?.generatedCacheBudget,
+		).toBe(1);
+
+		// A later turn in the same session starts from the reduced budget instead of
+		// re-triggering the rejection.
+		const nextStream = streamAnthropic(gatewayModel, toolLoopContext, {
+			apiKey: "sk-ant-test",
+			providerSessionState,
+		});
+		for await (const _ of nextStream) {
+			// drain stream
+		}
+		await nextStream.result();
+		expect(attempt).toBe(3);
+		expect(breakpointCounts[2]).toBe(1);
+	});
+
+	it("gives up generated caching only after the reduced budget is also rejected", async () => {
 		const gatewayModel: Model<"anthropic-messages"> = {
 			...model,
 			baseUrl: "https://proxy.example.com/anthropic",
@@ -810,7 +891,8 @@ describe("anthropic stream envelope handling", () => {
 		vi.spyOn(Messages.prototype, "create").mockImplementation((params: unknown) => {
 			attempt += 1;
 			breakpointCounts.push(cacheControlCount(params));
-			if (attempt === 1) {
+			// A gateway with no free slot at all rejects until we add nothing.
+			if (cacheControlCount(params) > 0) {
 				return createRejectedMockRequest(createCacheBreakpointOverflowError()) as never;
 			}
 			return createMockRequest(createTextSuccessEvents("recovered")) as never;
@@ -823,26 +905,17 @@ describe("anthropic stream envelope handling", () => {
 		}
 		const result = await stream.result();
 
-		expect(attempt).toBe(2);
-		expect(result.stopReason).toBe("stop");
-		expect(result.content).toEqual([{ type: "text", text: "recovered" }]);
-		expect(countEvents(events, "error")).toBe(0);
-		// The rejected attempt carried a generated marker; the retry carries none.
-		expect(breakpointCounts[0]).toBeGreaterThan(0);
-		expect(breakpointCounts[1]).toBe(0);
-		expect(
-			(providerSessionState.get("anthropic-messages") as { generatedCachingDisabled?: boolean } | undefined)
-				?.generatedCachingDisabled,
-		).toBe(true);
-
-		// A later turn in the same session must not reintroduce the rejected marker.
-		const nextStream = streamAnthropic(gatewayModel, context, { apiKey: "sk-ant-test", providerSessionState });
-		for await (const _ of nextStream) {
-			// drain stream
-		}
-		await nextStream.result();
+		// Two rejections are needed: 2 -> 1 -> 0. A single retry is not enough,
+		// which is exactly what the graded step buys over an immediate kill switch.
 		expect(attempt).toBe(3);
-		expect(breakpointCounts[2]).toBe(0);
+		expect(result.stopReason).toBe("stop");
+		expect(countEvents(events, "error")).toBe(0);
+		expect(breakpointCounts.at(-1)).toBe(0);
+		expect(breakpointCounts[0]).toBeGreaterThan(0);
+		expect(
+			(providerSessionState.get("anthropic-messages") as { generatedCacheBudget?: number } | undefined)
+				?.generatedCacheBudget,
+		).toBe(0);
 	});
 
 	it("recovers from a cache breakpoint overflow forwarded as a statusless proxy SSE error", async () => {
@@ -869,10 +942,14 @@ describe("anthropic stream envelope handling", () => {
 
 		expect(attempt).toBe(2);
 		expect(result.stopReason).toBe("stop");
-		expect(breakpointCounts[1]).toBe(0);
+		// A single-turn context has no assistant anchor, so explicit mode emits one
+		// marker and the reduced budget still spends it on the current turn. The
+		// gateway here frees a slot once we drop from two, so one marker is accepted.
+		expect(breakpointCounts[0]).toBe(1);
+		expect(breakpointCounts[1]).toBe(1);
 	});
 
-	it("does not suppress caching for unrelated invalid request errors", async () => {
+	it("does not reduce the cache budget for unrelated invalid request errors", async () => {
 		const gatewayModel: Model<"anthropic-messages"> = {
 			...model,
 			baseUrl: "https://proxy.example.com/anthropic",
@@ -896,9 +973,9 @@ describe("anthropic stream envelope handling", () => {
 		expect(result.errorMessage).toContain("Some other validation error");
 		expect(countEvents(events, "error")).toBe(1);
 		expect(
-			(providerSessionState.get("anthropic-messages") as { generatedCachingDisabled?: boolean } | undefined)
-				?.generatedCachingDisabled,
-		).toBe(false);
+			(providerSessionState.get("anthropic-messages") as { generatedCacheBudget?: number } | undefined)
+				?.generatedCacheBudget,
+		).toBe(2);
 	});
 
 	it("does not retry malformed envelopes after partial tool-call content starts streaming", async () => {
