@@ -395,8 +395,20 @@ export function isAnthropicFastModeUnsupportedError(error: unknown): boolean {
 	return false;
 }
 
+/**
+ * Proxies (e.g. CLIProxyAPI) can deliver Anthropic's 400 body as an in-stream
+ * SSE `error` event on an HTTP 200 response; the thrown error then carries no
+ * HTTP status at all (issue #3900). Accept both the direct 400 and the
+ * statusless SSE shape — the strict `invalid_request_error` message checks in
+ * each matcher keep the statusless branch from claiming unrelated failures.
+ */
+function isAnthropicInvalidRequestStatus(error: unknown): boolean {
+	const status = extractHttpStatusFromError(error);
+	return status === 400 || status === undefined;
+}
+
 export function isAnthropicThinkingBlockMutationError(error: unknown): boolean {
-	if (extractHttpStatusFromError(error) !== 400) return false;
+	if (!isAnthropicInvalidRequestStatus(error)) return false;
 	const message = error instanceof Error ? error.message : String(error);
 	return (
 		/invalid_request_error/i.test(message) &&
@@ -414,13 +426,34 @@ export function isAnthropicThinkingBlockMutationError(error: unknown): boolean {
  * than only the latest one.
  */
 export function isAnthropicThinkingSignatureInvalidError(error: unknown): boolean {
-	if (extractHttpStatusFromError(error) !== 400) return false;
+	if (!isAnthropicInvalidRequestStatus(error)) return false;
 	const message = error instanceof Error ? error.message : String(error);
 	return (
 		/invalid_request_error/i.test(message) &&
 		/thinking|redacted_thinking/i.test(message) &&
 		/invalid\s+`?signature`?/i.test(message)
 	);
+}
+
+/**
+ * CLIProxyAPI replaces Anthropic's rejection body wholesale instead of forwarding
+ * it: the client only ever sees
+ * `{"type":"error","error":{"type":"api_error","message":"An error occurred while
+ * processing the request."}}`, delivered as an in-stream SSE `error` event on an
+ * HTTP 200 response, so neither the status nor the message survives. Captured CPA
+ * traces for that masked shape carry the thinking-integrity 400 upstream (issue
+ * #3900), and the generic body matches no transient phrase either, so the turn
+ * dies unrecoverably. Nothing in the payload names the cause; callers must pair
+ * this with a request that actually replays signed thinking blocks before
+ * treating it as a thinking-replay rejection.
+ */
+export function isAnthropicMaskedProxyRejection(error: unknown): boolean {
+	const status = extractHttpStatusFromError(error);
+	if (status !== undefined && status !== 400) return false;
+	const message = error instanceof Error ? error.message : String(error);
+	// A body that still names its error type is classified by the strict matchers.
+	if (/invalid_request_error/i.test(message)) return false;
+	return /"type"\s*:\s*"api_error"/.test(message) && /an error occurred while processing/i.test(message);
 }
 
 function hasStrictAnthropicTools(params: MessageCreateParamsStreaming): boolean {
@@ -447,12 +480,21 @@ function dropAnthropicStrictTools(params: MessageCreateParamsStreaming): void {
 	}
 }
 
+function isClaudeFamilyModel(model: Model<"anthropic-messages">): boolean {
+	// Classify the same identifier the request body serializes (`params.model =
+	// model.id` in buildParams); a differing `wireModelId` is not dispatched by
+	// this transport, so it must not drive the cache decision either.
+	const id = model.id;
+	const shortId = id.includes("/") ? id.slice(id.lastIndexOf("/") + 1) : id;
+	return shortId.toLowerCase().startsWith("claude-");
+}
+
 function getCacheControl(
 	model: Model<"anthropic-messages">,
 	baseUrl: string,
 	cacheRetention?: CacheRetention,
 ): { mode: AnthropicCacheMode; cacheControl?: AnthropicCacheControl } {
-	const retention = resolveCacheRetention(cacheRetention, "long");
+	const retention = resolveCacheRetention(cacheRetention ?? model.cacheRetention, "long");
 	if (retention === "none") return { mode: "none" };
 
 	const isCanonicalApi = isAnthropicApiBaseUrl(baseUrl);
@@ -462,7 +504,7 @@ function getCacheControl(
 			? "none"
 			: promptCacheMode === "explicit"
 				? "explicit"
-				: isCanonicalApi
+				: promptCacheMode === "automatic" || isCanonicalApi || isClaudeFamilyModel(model)
 					? "automatic"
 					: "none";
 	if (mode === "none") return { mode };
@@ -1847,7 +1889,12 @@ export const streamAnthropic: StreamFunction<"anthropic-messages"> = (
 						!options?.fallbackManaged &&
 						!repairAllAssistantThinking &&
 						firstTokenTime === undefined &&
-						(thinkingSignatureInvalid || isAnthropicThinkingBlockMutationError(streamFailure))
+						(thinkingSignatureInvalid ||
+							isAnthropicThinkingBlockMutationError(streamFailure) ||
+							// Masked proxy rejection: unclassifiable on its own, so the replayed
+							// request shape is the evidence. Without signed thinking blocks in
+							// flight there is nothing to repair and the error must surface.
+							(isAnthropicMaskedProxyRejection(streamFailure) && hasNativeThinkingBlocks(params.messages)))
 					) {
 						// The mutation 400 blames the "latest assistant message", but its cited
 						// `messages.N.content.M` path can point at an EARLIER replayed turn, so the
