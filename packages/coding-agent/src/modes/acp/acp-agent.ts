@@ -726,6 +726,12 @@ export function acpPromptPayload(blocks: PromptRequest["prompt"]): {
  * `-32603 Internal error`, which hides the reason and defeats client-side
  * recovery (an ACP client cannot see that it must authenticate). Map the codes
  * that have a defined ACP/JSON-RPC counterpart onto a real `RequestError`.
+ *
+ * The human reason travels in the JSON-RPC `message` only. The SDK already
+ * inlines the second argument into it (`Internal error: <reason>`), so echoing
+ * the same text back as `data.details` made every client that renders both
+ * fields print the reason twice — `Internal error: <reason>: <reason>`. `data`
+ * carries the machine discriminator, never a copy of the human message.
  */
 export function acpRequestFailure(error: unknown): unknown {
 	const code = typeof error === "object" && error !== null && "code" in error ? error.code : undefined;
@@ -733,7 +739,7 @@ export function acpRequestFailure(error: unknown): unknown {
 	const message = error instanceof Error ? error.message : code;
 	switch (code) {
 		case "authentication_failed":
-			return RequestError.authRequired({ code, details: message }, message);
+			return RequestError.authRequired({ code }, message);
 		// `not_found` stays -32603 with its discriminator in `data`: ACP's
 		// `resourceNotFound` (-32002) is a URI-addressed resource error, and an unknown
 		// session id is not a resource URI. Pinned ACP core-v1 conformance also requires
@@ -741,12 +747,12 @@ export function acpRequestFailure(error: unknown): unknown {
 		case "invalid_input":
 		case "unsupported":
 		case "unsupported_content":
-			return RequestError.invalidParams({ code, details: message }, message);
+			return RequestError.invalidParams({ code }, message);
 		default:
 			// The remaining internal codes (conflict, unavailable, busy, …) have no ACP
 			// counterpart and stay -32603. Keep the discriminator in `data` so a client can
 			// branch on retry/reconnect instead of parsing an English message.
-			return RequestError.internalError({ code, details: message }, message);
+			return RequestError.internalError({ code }, message);
 	}
 }
 
