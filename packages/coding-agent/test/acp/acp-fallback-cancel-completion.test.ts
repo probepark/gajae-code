@@ -319,6 +319,17 @@ describe("ACP request failure codes", () => {
 		expect(acpRequestFailure(requestError)).toBe(requestError);
 		expect(requestError.code).toBe(-32602);
 	});
+	it("states the failure reason exactly once across message and data", () => {
+		// Regression: `data.details` used to repeat the same text the SDK already
+		// inlines into `message`, so clients rendering both printed
+		// "Internal error: <reason>: <reason>".
+		const reason = "No ready SDK endpoint remains available.";
+		const failure = acpRequestFailure(new AcpSdkAdapterError("unavailable", reason)) as RequestError;
+
+		expect(failure.message).toBe(`Internal error: ${reason}`);
+		expect(failure.data).toEqual({ code: "unavailable" });
+		expect(JSON.stringify(failure.data)).not.toContain(reason);
+	});
 
 	// The proxy has two arms: a synchronous `try/catch` and a `.catch` on a returned
 	// Promise. Every real agent method is `async`, so the Promise arm is the production
